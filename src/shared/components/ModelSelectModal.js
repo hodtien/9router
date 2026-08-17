@@ -30,6 +30,7 @@ export default function ModelSelectModal({
   title = "Select Model",
   modelAliases = {},
   kindFilter = null,
+  capFilter = null,
   addedModelValues = [],
   closeOnSelect = true,
   hideCombos = false,
@@ -402,11 +403,11 @@ export default function ModelSelectModal({
 
   // Filter combos by search query (and hide combos when kindFilter is set — combos are LLM-only by design)
   const filteredCombos = useMemo(() => {
-    if (kindFilter || hideCombos) return [];
+    if (kindFilter || hideCombos || capFilter) return [];
     if (!searchQuery.trim()) return combos;
     const query = searchQuery.toLowerCase();
     return combos.filter(c => c.name.toLowerCase().includes(query));
-  }, [combos, searchQuery, kindFilter, hideCombos]);
+  }, [combos, searchQuery, kindFilter, hideCombos, capFilter]);
 
   // Sort models alphabetically, with added models floated to top
   const sortModels = (models) => {
@@ -422,6 +423,11 @@ export default function ModelSelectModal({
     const filtered = {};
     Object.entries(groupedModels).forEach(([providerId, group]) => {
       let models = group.models;
+      // Filter by input-modality capability (vision/pdf/audioInput/videoInput).
+      if (capFilter) {
+        models = models.filter((m) => getCaps(m.value)?.[capFilter] === true);
+        if (models.length === 0) return;
+      }
       if (query) {
         const providerNameMatches = group.name.toLowerCase().includes(query);
         models = models.filter(
