@@ -1,4 +1,3 @@
-import crypto from "crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS, PROVIDER_OAUTH } from "../config/providers.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE, selectAnthropicBeta } from "../providers/shared.js";
@@ -167,7 +166,7 @@ export class DefaultExecutor extends BaseExecutor {
     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
   }
 
-  transformRequest(model, body, stream, credentials) {
+  transformRequest(model, body) {
     const transformed = this.applyJsonSchemaFallback(body);
 
     if (transformed && typeof transformed === "object") {
@@ -175,7 +174,6 @@ export class DefaultExecutor extends BaseExecutor {
       if (this.config.quirks?.dropClientMetadata) {
         delete transformed.client_metadata;
       }
-      injectPromptCacheKey(this.provider, transformed, credentials);
       stripUnsupportedParams(this.provider, model, transformed);
       // Enforce provider/model-specific param floors (e.g. Sakana fugu-ultra
       // requires max_tokens >= 16 across chat, completion, and Responses APIs).
