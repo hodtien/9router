@@ -52,7 +52,12 @@ function ensureSqliteRuntime({ silent = false } = {}) {
 
   let sqlJsOk = isSqlJsWasmValid();
   if (!sqlJsOk) {
-    sqlJsOk = npmInstall([`sql.js@${SQL_JS_VERSION}`], { silent });
+    sqlJsOk = installRuntimePackages([`sql.js@${SQL_JS_VERSION}`], {
+      silent,
+      label: "sql.js fallback",
+      failureTitle: "sql.js install failed",
+      failureHint: "SQLite fallback unavailable",
+    });
     if (sqlJsOk) sqlJsOk = isSqlJsWasmValid();
   }
 
