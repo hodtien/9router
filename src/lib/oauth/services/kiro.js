@@ -519,9 +519,17 @@ export class KiroService {
   }
 
   /**
-   * List available CodeWhisperer profiles for OAuth/IDC tokens and return the
-   * best-matching profileArn. API keys use the Amazon Q model catalog instead;
-   * ListAvailableProfiles does not support TokenType=API_KEY.
+   * List available CodeWhisperer profiles for a token (or API key) and return
+   * the best-matching profileArn. AWS SSO OIDC logins return no profileArn, so
+   * it must be fetched separately — the same call works for API-key auth.
+   * Accepts both `arn` and `profileArn` response field names (the API-key
+   * JSON-1.0 surface returns `arn`).
+   *
+   * options.authMethod:
+   * - "external_idp" → send tokentype:EXTERNAL_IDP (required by upstream)
+   * - "api_key" / default → do NOT send tokentype:API_KEY. ListAvailableProfiles
+   *   returns 403 "API key authentication is not supported for this operation"
+   *   when that header is present. Chat/usage paths still send tokentype:API_KEY.
    */
   async listAvailableProfiles(accessToken, region = "us-east-1", options = {}) {
     assertValidAwsRegion(region);
@@ -600,7 +608,9 @@ export class KiroService {
     const trimmed = apiKey.trim();
 
     try {
-      await this.listAvailableApiKeyModels(trimmed, region);
+      // Pass authMethod for clarity; listAvailableProfiles intentionally does
+      // NOT attach tokentype:API_KEY for this operation (upstream 403s it).
+      profileArn = await this.listAvailableProfiles(trimmed, region, { authMethod: "api_key" });
     } catch (error) {
       throw new Error(`API key validation failed: ${error.message}`);
     }
