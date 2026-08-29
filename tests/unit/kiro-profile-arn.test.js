@@ -35,9 +35,9 @@ describe("kiro API-key auth (KiroService.validateApiKey)", () => {
     expect(url).toBe(
       "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
     );
-    // ListAvailableProfiles rejects tokentype:API_KEY with 403
-    expect(init.headers.tokentype).toBeUndefined();
-    expect(init.headers.TokenType).toBeUndefined();
+    expect(init.method).toBe("GET");
+    expect(init.headers.Authorization).toBe("Bearer my-secret-key");
+    expect(init.headers.TokenType).toBe("API_KEY");
   });
 
   it("rejects an empty API key without a network call", async () => {

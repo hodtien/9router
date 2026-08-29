@@ -608,9 +608,7 @@ export class KiroService {
     const trimmed = apiKey.trim();
 
     try {
-      // Pass authMethod for clarity; listAvailableProfiles intentionally does
-      // NOT attach tokentype:API_KEY for this operation (upstream 403s it).
-      profileArn = await this.listAvailableProfiles(trimmed, region, { authMethod: "api_key" });
+      await this.listAvailableApiKeyModels(trimmed, region);
     } catch (error) {
       throw new Error(`API key validation failed: ${error.message}`);
     }
