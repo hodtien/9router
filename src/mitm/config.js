@@ -18,15 +18,35 @@ const TARGET_HOSTS = [
   "cloudcode-pa.googleapis.com",
   "api.individual.githubcopilot.com",
   "q.us-east-1.amazonaws.com",
+  "codewhisperer.us-east-1.amazonaws.com",
+  "runtime.us-east-1.kiro.dev",
   "api2.cursor.sh",
 ];
 
 const URL_PATTERNS = {
   antigravity: [":generateContent", ":streamGenerateContent"],
   copilot: ["/chat/completions", "/v1/messages", "/responses"],
+  // Legacy path form. Kiro IDE 1.0.228+ posts to `/` with x-amz-target instead —
+  // see isChatRequest() for the header-based match.
   kiro: ["/generateAssistantResponse"],
   cursor: ["/BidiAppend", "/RunSSE", "/RunPoll", "/Run"],
 };
+
+/**
+ * Whether this request is a chat turn we should intercept (vs passthrough).
+ * Kiro Runtime moved GenerateAssistantResponse from path `/generateAssistantResponse`
+ * to `POST /` + `x-amz-target: KiroRuntimeService.GenerateAssistantResponse`
+ * (verified via live mitmproxy capture of Kiro IDE 1.0.228).
+ */
+function isChatRequest(tool, req) {
+  const patterns = URL_PATTERNS[tool] || [];
+  if (patterns.some((p) => (req.url || "").includes(p))) return true;
+  if (tool === "kiro") {
+    const target = String(req.headers?.["x-amz-target"] || "");
+    return target.includes("GenerateAssistantResponse");
+  }
+  return false;
+}
 
 // Synonym map: rawModel from request → canonical alias key in mitmAlias DB
 const MODEL_SYNONYMS = {
@@ -35,6 +55,9 @@ const MODEL_SYNONYMS = {
     "gemini-3.5-flash-high": "gemini-3-flash-agent",
     "gemini-3.5-flash-medium": "gemini-3.5-flash-low",
     "gemini-3.5-flash-extra-low": "gemini-3.5-flash-extra-low",
+     "gemini-3.7-flash-high": "gemini-3.7-flash-high",
+    "gemini-3.7-flash-medium": "gemini-3.7-flash-medium",
+    "gemini-3.7-flash-low": "gemini-3.7-flash-low",
     "gemini-3.1-pro-high": "gemini-pro-agent",
     "gemini-3-pro-high": "gemini-pro-agent",
     "gemini-3-pro-low": "gemini-3.1-pro-low",
@@ -79,9 +102,52 @@ function getToolForHost(host) {
   const h = (host || "").split(":")[0];
   if (h === "api.individual.githubcopilot.com") return "copilot";
   if (h === "daily-cloudcode-pa.googleapis.com" || h === "cloudcode-pa.googleapis.com") return "antigravity";
-  if (h === "q.us-east-1.amazonaws.com") return "kiro";
+  if (h === "q.us-east-1.amazonaws.com" || h === "codewhisperer.us-east-1.amazonaws.com" || h === "runtime.us-east-1.kiro.dev") return "kiro";
   if (h === "api2.cursor.sh") return "cursor";
   return null;
 }
 
-module.exports = { IS_DEV, LSOF_BIN, TARGET_HOSTS, URL_PATTERNS, MODEL_SYNONYMS, MODEL_PATTERNS, MODEL_NO_MAP, LOG_BLACKLIST_URL_PARTS, getToolForHost };
+function isBinaryData(buffer) {
+  if (!buffer || buffer.length === 0) return false;
+  const sample = buffer.slice(0, Math.min(100, buffer.length));
+  let nonPrintable = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const byte = sample[i];
+    if (byte < 0x20 && byte !== 0x09 && byte !== 0x0A && byte !== 0x0D) {
+      nonPrintable++;
+    }
+    if (byte > 0x7E) nonPrintable++;
+  }
+  return (nonPrintable / sample.length) > 0.3;
+}
+
+// Extract model from URL path (Gemini), body (OpenAI/Anthropic), or Kiro conversationState.
+function extractModel(url, body) {
+  const urlMatch = url.match(/\/models\/([^/:]+)/);
+  const urlModel = urlMatch?.[1] || null;
+
+  if (isBinaryData(body)) return urlModel;
+
+  try {
+    const parsed = JSON.parse(body.toString());
+    if (parsed.conversationState) {
+      return parsed.conversationState.currentMessage?.userInputMessage?.modelId || null;
+    }
+    const model = urlModel || parsed.model || null;
+    const cleanModelName = String(model).replace(/^models\//, "");
+    if (cleanModelName === "gemini-3.6-flash-tiered" || cleanModelName === "gemini-3.7-flash-tiered") {
+      const ver = cleanModelName.includes("3.7") ? "3.7" : "3.6";
+      const rawLevel = parsed.request?.generationConfig?.thinkingConfig?.thinkingLevel
+        || parsed.generationConfig?.thinkingConfig?.thinkingLevel;
+      const level = ["high", "medium", "low"].includes(String(rawLevel).toLowerCase())
+        ? String(rawLevel).toLowerCase()
+        : "medium";
+      return `gemini-${ver}-flash-${level}`;
+    }
+    return model;
+  } catch {
+    return urlModel;
+  }
+}
+
+module.exports = { IS_DEV, LSOF_BIN, TARGET_HOSTS, URL_PATTERNS, MODEL_SYNONYMS, MODEL_PATTERNS, MODEL_NO_MAP, LOG_BLACKLIST_URL_PARTS, getToolForHost, isChatRequest, extractModel };
