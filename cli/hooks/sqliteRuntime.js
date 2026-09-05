@@ -12,16 +12,36 @@ const {
   summarizeNpmError,
 } = require("./runtimeInstall");
 
-const BETTER_SQLITE3_VERSION = "12.6.2";
+// Gate the pinned version by Node major, mirroring src/lib/db/driver.js gating
+// style: 13.x is N-API and ships per-platform prebuilds inside the package, so
+// it needs no ABI-specific download. It requires Node >= 22; older runtimes stay
+// on 12.6.2, which fetches an ABI-specific binary via prebuild-install.
+const [NODE_MAJOR] = process.versions.node.split(".").map(Number);
+const USE_NAPI_BUILD = NODE_MAJOR >= 22;
+const BETTER_SQLITE3_VERSION = USE_NAPI_BUILD ? "13.0.3" : "12.6.2";
 const SQL_JS_VERSION = "1.14.1";
 
 function hasModule(name) {
   return fs.existsSync(path.join(getRuntimeNodeModules(), name, "package.json"));
 }
 
+function isGlibcRuntime() {
+  try { return Boolean(process.report?.getReport()?.header?.glibcVersionRuntime); } catch { return true; }
+}
+
+// 12.x compiles/downloads into build/Release; 13.x ships prebuilds/<platform>-<arch>.node.
+function getBetterSqliteBinary() {
+  const root = path.join(getRuntimeNodeModules(), "better-sqlite3");
+  const platform = process.platform === "linux" && !isGlibcRuntime() ? "linuxmusl" : process.platform;
+  return [
+    path.join(root, "build", "Release", "better_sqlite3.node"),
+    path.join(root, "prebuilds", `${platform}-${process.arch}.node`),
+  ].find((file) => fs.existsSync(file));
+}
+
 function isBetterSqliteBinaryValid() {
-  const binary = path.join(getRuntimeNodeModules(), "better-sqlite3", "build", "Release", "better_sqlite3.node");
-  if (!fs.existsSync(binary)) return false;
+  const binary = getBetterSqliteBinary();
+  if (!binary) return false;
   try {
     const fd = fs.openSync(binary, "r");
     const buf = Buffer.alloc(4);
@@ -52,7 +72,12 @@ function ensureSqliteRuntime({ silent = false } = {}) {
 
   let sqlJsOk = isSqlJsWasmValid();
   if (!sqlJsOk) {
-    sqlJsOk = npmInstall([`sql.js@${SQL_JS_VERSION}`], { silent });
+    sqlJsOk = installRuntimePackages([`sql.js@${SQL_JS_VERSION}`], {
+      silent,
+      label: "sql.js fallback",
+      failureTitle: "sql.js install failed",
+      failureHint: "SQLite fallback unavailable",
+    });
     if (sqlJsOk) sqlJsOk = isSqlJsWasmValid();
   }
 
@@ -62,11 +87,15 @@ function ensureSqliteRuntime({ silent = false } = {}) {
     return { betterSqlite: true, sqlJs: sqlJsOk };
   }
 
+  // npm injects an implicit `node-gyp rebuild` for any package carrying a
+  // binding.gyp, which would demand build tools even though 13.x already bundles
+  // the binary — skip scripts so the bundled prebuild is used as-is.
   const ok = installRuntimePackages([`better-sqlite3@${BETTER_SQLITE3_VERSION}`], {
     silent,
     label: "SQLite engine",
     failureTitle: "SQLite engine install failed — using fallback",
     failureHint: "using fallback",
+    extraArgs: USE_NAPI_BUILD ? ["--ignore-scripts"] : [],
   });
   return {
     betterSqlite: ok && hasModule("better-sqlite3") && isBetterSqliteBinaryValid(),
