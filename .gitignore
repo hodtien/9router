@@ -93,3 +93,6 @@ test-results/
 .codegraph/
 .PR/
 .next-analyze/*
+
+# Kiro local workspace state
+.kiro/
