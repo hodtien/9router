@@ -130,20 +130,12 @@ function getProviderConfig(provider, credentials = null) {
   return PROVIDERS[provider] || PROVIDERS.openai;
 }
 
-// Get target format for provider.
-// `credentials` (optional) carries per-connection overrides such as
-// `providerSpecificData.apiType` (force an OpenAI-compatible node to the chat
-// or responses transport regardless of its id) or
-// `providerSpecificData.useChatCompletions` (an anthropic-compatible node that
-// is actually an OpenAI-shape gateway).
+// Get target format for provider
 export function getTargetFormat(provider, credentials = null) {
   if (isOpenAICompatible(provider)) {
     return resolveOpenAICompatibleApiType(provider, credentials) === "responses" ? "openai-responses" : "openai";
   }
   if (isAnthropicCompatible(provider)) {
-    if (credentials?.providerSpecificData?.useChatCompletions === true) {
-      return "openai";
-    }
     return "claude";
   }
   const config = getProviderConfig(provider, credentials);

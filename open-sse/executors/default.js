@@ -6,63 +6,7 @@ import { OAUTH_ENDPOINTS, buildKimiHeaders } from "../config/appConstants.js";
 import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
-import { stripUnsupportedParams, enforceParamMinimums } from "../translator/concerns/paramSupport.js";
-import { resolveSessionId } from "../utils/sessionManager.js";
-
-// Prompt-cache key injection for OpenAI-style upstreams.
-// - xAI (Grok): always on. Caching is automatic server-side; sticky routing via
-//   `prompt_cache_key` (body) + `x-grok-conv-id` (header) maximizes hit rate.
-//   See https://docs.x.ai/developers/advanced-api-usage/prompt-caching
-// - openai-compatible-*: opt-in only (some gateways reject unknown fields) via
-//   providerSpecificData.enablePromptCacheKey === true.
-export function normalizePromptCacheKey(provider, sessionId) {
-  if (!sessionId) return "";
-  const scoped = `${provider || "openai-compatible"}:${sessionId}`;
-  return `cc_${crypto.createHash("sha256").update(scoped).digest("hex").slice(0, 32)}`;
-}
-
-export function shouldInjectPromptCacheKey(provider, credentials) {
-  if (provider === "xai") return true;
-  return credentials?.providerSpecificData?.enablePromptCacheKey === true;
-}
-
-export function resolvePromptCacheKey(provider, body, credentials) {
-  if (typeof body?.prompt_cache_key === "string" && body.prompt_cache_key) {
-    return body.prompt_cache_key;
-  }
-  if (typeof credentials?._promptCacheKey === "string" && credentials._promptCacheKey) {
-    return credentials._promptCacheKey;
-  }
-  const sessionId = credentials?._clientSessionId || resolveSessionId({
-    headers: credentials?.rawHeaders,
-    body: body || {},
-    connectionId: credentials?.connectionId,
-    workspaceId: credentials?.providerSpecificData?.workspaceId,
-    scope: provider,
-  });
-  return normalizePromptCacheKey(provider, sessionId);
-}
-
-export function injectPromptCacheKey(provider, body, credentials) {
-  if (!body || typeof body !== "object") return body;
-  if (!shouldInjectPromptCacheKey(provider, credentials)) return body;
-  if (typeof body.prompt_cache_key === "string" && body.prompt_cache_key) {
-    if (credentials) credentials._promptCacheKey = body.prompt_cache_key;
-    return body;
-  }
-
-  // translateRequest() already captured a conversation-stable id into
-  // credentials._clientSessionId; fall back to resolving one here so this
-  // also works on the same-format fast path (openai→openai) where capture
-  // may not have run. The upstream key is a short provider-scoped hash rather
-  // than a raw client/session identifier, keeping it stable but provider-safe.
-  const promptCacheKey = resolvePromptCacheKey(provider, body, credentials);
-  if (promptCacheKey) {
-    body.prompt_cache_key = promptCacheKey;
-    if (credentials) credentials._promptCacheKey = promptCacheKey;
-  }
-  return body;
-}
+import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
 const BEARER = { combined: true, header: "Authorization", scheme: "bearer" };
@@ -100,49 +44,6 @@ const HEADER_HOOKS = {
   kilocodeOrg: (h, c) => { if (c.providerSpecificData?.orgId) h["X-Kilocode-OrganizationID"] = c.providerSpecificData.orgId; },
 };
 
-// Denylist for operator-set custom headers: hop-by-hop/framing + auth headers
-// that must come from the connection's credentials, never from customHeaders.
-const FORBIDDEN_CUSTOM_HEADERS = new Set([
-  "host", "connection", "content-length", "keep-alive", "proxy-connection",
-  "transfer-encoding", "te", "trailer", "upgrade",
-  "authorization", "x-api-key", "x-goog-api-key", "api-key",
-  "cookie", "set-cookie",
-]);
-
-function isForbiddenCustomHeaderName(name) {
-  return FORBIDDEN_CUSTOM_HEADERS.has(String(name).trim().toLowerCase());
-}
-
-/**
- * Apply operator-configured per-provider custom headers onto an outgoing header
- * map. Strips CR/LF/NUL from names/values, drops forbidden headers, and
- * replaces existing same-named headers (case-insensitive).
- * @param {object} headers - Target headers object (mutated in-place)
- * @param {unknown} rawCustomHeaders - From credentials.providerSpecificData.customHeaders
- */
-function applyCustomHeaders(headers, rawCustomHeaders) {
-  if (!rawCustomHeaders || typeof rawCustomHeaders !== "object" || Array.isArray(rawCustomHeaders)) {
-    if (typeof rawCustomHeaders === "string") {
-      try { rawCustomHeaders = JSON.parse(rawCustomHeaders); } catch { return; }
-      if (typeof rawCustomHeaders !== "object" || Array.isArray(rawCustomHeaders)) return;
-    } else {
-      return;
-    }
-  }
-  for (const [k, v] of Object.entries(rawCustomHeaders)) {
-    if (typeof k !== "string" || typeof v !== "string") continue;
-    if (isForbiddenCustomHeaderName(k)) continue;
-    if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) continue;
-    const trimmedKey = k.trim();
-    const trimmedVal = v.trim();
-    const lower = trimmedKey.toLowerCase();
-    for (const existing of Object.keys(headers)) {
-      if (existing.toLowerCase() === lower) delete headers[existing];
-    }
-    headers[trimmedKey] = trimmedVal;
-  }
-}
-
 // Config-driven OAuth refresh grants — derived from registry oauth.refresh.
 const REFRESH_GRANTS = Object.fromEntries(
   Object.entries(PROVIDER_OAUTH)
@@ -175,9 +76,6 @@ export class DefaultExecutor extends BaseExecutor {
         delete transformed.client_metadata;
       }
       stripUnsupportedParams(this.provider, model, transformed);
-      // Enforce provider/model-specific param floors (e.g. Sakana fugu-ultra
-      // requires max_tokens >= 16 across chat, completion, and Responses APIs).
-      enforceParamMinimums(this.provider, model, transformed);
     }
 
     return injectReasoningContent({ provider: this.provider, model, body: transformed });
@@ -218,13 +116,6 @@ export class DefaultExecutor extends BaseExecutor {
     if (this.provider?.startsWith?.("anthropic-compatible-")) {
       const baseUrl = credentials?.providerSpecificData?.baseUrl || ANTHROPIC_COMPAT_BASE;
       const normalized = baseUrl.replace(/\/$/, "");
-      // Some third-party Anthropic-compatible gateways only expose OpenAI-shape
-      // /v1/chat/completions. When the node was created via auto-detect or
-      // explicitly flipped, route through chat_completions with the OpenAI-shape
-      // body shape (handled in transformRequest below).
-      if (credentials?.providerSpecificData?.useChatCompletions === true) {
-        return `${normalized}/chat/completions`;
-      }
       return `${normalized}/messages`;
     }
     // gemini-format: build :streamGenerateContent / :generateContent path
@@ -301,18 +192,6 @@ export class DefaultExecutor extends BaseExecutor {
     }
 
     if (stream) headers["Accept"] = "text/event-stream";
-
-    // xAI: sticky routing for automatic prompt caching (chat completions).
-    // Docs recommend `x-grok-conv-id`; Responses API also accepts body.prompt_cache_key.
-    if (this.provider === "xai") {
-      const cacheKey = resolvePromptCacheKey(this.provider, null, credentials);
-      if (cacheKey && !headers["x-grok-conv-id"] && !headers["X-Grok-Conv-Id"]) {
-        headers["x-grok-conv-id"] = cacheKey;
-      }
-    }
-
-    // Apply operator-configured custom headers after auth so they can't override credentials.
-    applyCustomHeaders(headers, credentials?.providerSpecificData?.customHeaders);
     return headers;
   }
 
