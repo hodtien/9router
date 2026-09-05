@@ -19,11 +19,15 @@ function isAnthropicCompatible(provider) {
   return typeof provider === "string" && provider.startsWith(ANTHROPIC_COMPATIBLE_PREFIX);
 }
 
-export function getOpenAICompatibleType(provider, credentials = null) {
-  if (!isOpenAICompatible(provider)) return "chat";
-  const apiType = credentials?.providerSpecificData?.apiType;
-  if (apiType === "responses" || apiType === "chat") return apiType;
-  return provider.includes("responses") ? "responses" : "chat";
+// Resolve the API type (chat vs responses) for an openai-compatible node.
+// The stored apiType on the connection's providerSpecificData (kept in sync with
+// the node on create/update) is authoritative. Falls back to the node ID
+// substring for legacy nodes created before apiType was persisted — their IDs
+// embed the type: openai-compatible-<chat|responses>-<uuid>.
+export function resolveOpenAICompatibleApiType(provider, credentials = null) {
+  const stored = credentials?.providerSpecificData?.apiType;
+  if (stored === "chat" || stored === "responses") return stored;
+  return typeof provider === "string" && provider.includes("responses") ? "responses" : "chat";
 }
 
 // Detect request format from body structure
@@ -107,9 +111,9 @@ export function detectFormat(body) {
 }
 
 // Get provider config (internal — no external runtime consumer)
-function getProviderConfig(provider) {
+function getProviderConfig(provider, credentials = null) {
   if (isOpenAICompatible(provider)) {
-    const apiType = getOpenAICompatibleType(provider);
+    const apiType = resolveOpenAICompatibleApiType(provider, credentials);
     return {
       ...PROVIDERS.openai,
       format: apiType === "responses" ? "openai-responses" : "openai",
@@ -126,23 +130,15 @@ function getProviderConfig(provider) {
   return PROVIDERS[provider] || PROVIDERS.openai;
 }
 
-// Get target format for provider.
-// `credentials` (optional) carries per-connection overrides such as
-// `providerSpecificData.apiType` (force an OpenAI-compatible node to the chat
-// or responses transport regardless of its id) or
-// `providerSpecificData.useChatCompletions` (an anthropic-compatible node that
-// is actually an OpenAI-shape gateway).
+// Get target format for provider
 export function getTargetFormat(provider, credentials = null) {
   if (isOpenAICompatible(provider)) {
-    return getOpenAICompatibleType(provider, credentials) === "responses" ? "openai-responses" : "openai";
+    return resolveOpenAICompatibleApiType(provider, credentials) === "responses" ? "openai-responses" : "openai";
   }
   if (isAnthropicCompatible(provider)) {
-    if (credentials?.providerSpecificData?.useChatCompletions === true) {
-      return "openai";
-    }
     return "claude";
   }
-  const config = getProviderConfig(provider);
+  const config = getProviderConfig(provider, credentials);
   return config.format || "openai";
 }
 

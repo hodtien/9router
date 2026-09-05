@@ -1,6 +1,4 @@
-import { KIRO_CONFIG, KIRO_EXTERNAL_IDP_DEFAULTS, assertValidAwsRegion } from "../constants/oauth.js";
-import http from "http";
-import { URL } from "url";
+import { KIRO_CONFIG, assertValidAwsRegion } from "../constants/oauth.js";
 
 /**
  * Kiro OAuth Service
@@ -12,17 +10,6 @@ import { URL } from "url";
  */
 
 const KIRO_AUTH_SERVICE = "https://prod.us-east-1.auth.desktop.kiro.dev";
-
-// Tiny HTML escape for the loopback capture success/failure pages. Avoids
-// pulling in a full DOM library for a few inline strings.
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 export class KiroService {
   /**
@@ -190,11 +177,6 @@ export class KiroService {
   async refreshToken(refreshToken, providerSpecificData = {}) {
     const { authMethod, clientId, clientSecret, region } = providerSpecificData;
 
-    // External IdP (Microsoft Entra ID) refresh — uses form-encoded OAuth2.
-    if (authMethod === "external_idp") {
-      return this.refreshExternalIdpToken(refreshToken, providerSpecificData);
-    }
-
     // AWS SSO OIDC refresh (Builder ID or IDC)
     if (clientId && clientSecret) {
       const safeRegion = region || "us-east-1";
@@ -254,247 +236,6 @@ export class KiroService {
   }
 
   /**
-   * External IdP (Microsoft Entra ID / Azure AD) — build OAuth2 authorize URL.
-   *
-   * Standard public-client OAuth2 authorization code flow with PKCE. `issuerUrl`
-   * is the tenant issuer (e.g. https://login.microsoftonline.com/{tenant}/v2.0
-   * or https://login.microsoftonline.com/common/v2.0 for multi-tenant). The
-   * `authorize` endpoint is discovered from `<issuerUrl>/.well-known/openid-configuration`,
-   * but we also accept a fully-formed `authEndpoint` for callers that already
-   * resolved OIDC metadata.
-   *
-   * Returns the fully-qualified authorize URL the user should be sent to.
-   */
-  buildExternalIdpAuthUrl({ issuerUrl, clientId, scopes, codeChallenge, state, redirectUri, authEndpoint }) {
-    if (!clientId || !codeChallenge || !state) {
-      throw new Error("external_idp authorize requires clientId, codeChallenge, state");
-    }
-    const endpoint = authEndpoint || `${issuerUrl.replace(/\/$/, "")}/oauth2/v2.0/authorize`;
-    const finalScopes = scopes || KIRO_EXTERNAL_IDP_DEFAULTS.scopes;
-    const finalRedirect = redirectUri || KIRO_EXTERNAL_IDP_DEFAULTS.redirectUri;
-
-    const url = new URL(endpoint);
-    url.searchParams.set("client_id", clientId);
-    url.searchParams.set("response_type", "code");
-    url.searchParams.set("redirect_uri", finalRedirect);
-    url.searchParams.set("scope", finalScopes);
-    url.searchParams.set("code_challenge", codeChallenge);
-    url.searchParams.set("code_challenge_method", "S256");
-    url.searchParams.set("response_mode", "query");
-    url.searchParams.set("state", state);
-    return url.toString();
-  }
-
-  /**
-   * External IdP — exchange authorization code for tokens.
-   *
-   * Form-encoded body per RFC 6749 §4.1.3. Returns the raw token response
-   * (accessToken, refreshToken, expiresIn, idToken, scope). The caller is
-   * responsible for resolving a CodeWhisperer profile ARN via
-   * `listAvailableProfiles` and storing the connection.
-   */
-  async exchangeExternalIdpCode({ issuerUrl, clientId, code, codeVerifier, redirectUri, scopes }) {
-    if (!issuerUrl || !clientId || !code || !codeVerifier) {
-      throw new Error("external_idp exchange requires issuerUrl, clientId, code, codeVerifier");
-    }
-    const tokenEndpoint = `${issuerUrl.replace(/\/$/, "")}/oauth2/v2.0/token`;
-    const finalRedirect = redirectUri || KIRO_EXTERNAL_IDP_DEFAULTS.redirectUri;
-    const finalScopes = scopes || KIRO_EXTERNAL_IDP_DEFAULTS.scopes;
-
-    const body = new URLSearchParams({
-      client_id: clientId,
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: finalRedirect,
-      code_verifier: codeVerifier,
-      scope: finalScopes,
-    });
-
-    const response = await fetch(tokenEndpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: body.toString(),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`External IdP token exchange failed (${response.status}): ${errorText}`);
-    }
-    const data = await response.json();
-    if (!data.access_token) {
-      throw new Error("External IdP token response missing access_token");
-    }
-    return {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token,
-      expiresIn: data.expires_in || 3600,
-      idToken: data.id_token,
-      scope: data.scope,
-    };
-  }
-
-  /**
-   * External IdP — refresh access token using refresh_token grant.
-   */
-  async refreshExternalIdpToken(refreshToken, providerSpecificData = {}) {
-    const { issuerUrl, clientId, scopes, redirectUri } = providerSpecificData;
-    if (!issuerUrl || !clientId) {
-      throw new Error("external_idp refresh requires issuerUrl and clientId in providerSpecificData");
-    }
-    const tokenEndpoint = `${issuerUrl.replace(/\/$/, "")}/oauth2/v2.0/token`;
-    const finalScopes = scopes || KIRO_EXTERNAL_IDP_DEFAULTS.scopes;
-
-    const body = new URLSearchParams({
-      client_id: clientId,
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      scope: finalScopes,
-    });
-
-    const response = await fetch(tokenEndpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: body.toString(),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`External IdP refresh failed (${response.status}): ${errorText}`);
-    }
-    const data = await response.json();
-    return {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token || refreshToken,
-      expiresIn: data.expires_in || 3600,
-      profileArn: providerSpecificData.profileArn,
-    };
-  }
-
-  /**
-   * Loopback capture server — binds 127.0.0.1:<port>, waits for one redirect
-   * from the external IdP at `<redirectUri>`, returns the captured `code` and
-   * `state`. The server is closed automatically after capture, on timeout,
-   * or on `cancel()`.
-   *
-   * Used by the authorize route to receive the user's Microsoft redirect.
-   * Returns a `{ promise, cancel }` pair so the caller can abort on route exit.
-   */
-  startLoopbackCapture({
-    port = KIRO_EXTERNAL_IDP_DEFAULTS.loopbackPort,
-    host = KIRO_EXTERNAL_IDP_DEFAULTS.loopbackHost,
-    redirectPath = "/oauth/callback",
-    expectedState,
-    timeoutMs = KIRO_EXTERNAL_IDP_DEFAULTS.loopbackTimeoutMs,
-  } = {}) {
-    let server = null;
-    let timeoutHandle = null;
-    let resolveCapture;
-    let rejectCapture;
-
-    const promise = new Promise((resolve, reject) => {
-      resolveCapture = resolve;
-      rejectCapture = reject;
-
-      server = http.createServer((req, res) => {
-        try {
-          const reqUrl = new URL(req.url, `http://${req.headers.host}`);
-          if (reqUrl.pathname !== redirectPath) {
-            res.statusCode = 404;
-            res.end("Not Found");
-            return;
-          }
-          const code = reqUrl.searchParams.get("code");
-          const state = reqUrl.searchParams.get("state");
-          const error = reqUrl.searchParams.get("error");
-          const errorDesc = reqUrl.searchParams.get("error_description");
-
-          // Reply to the browser so the user sees a success/failure page.
-          if (error) {
-            res.statusCode = 400;
-            res.setHeader("Content-Type", "text/html; charset=utf-8");
-            res.end(
-              `<!doctype html><meta charset="utf-8"><title>9router — Sign-in failed</title>` +
-              `<body style="font-family:system-ui;padding:2rem;max-width:40rem;margin:auto">` +
-              `<h1>Sign-in failed</h1><p>${escapeHtml(error)}: ${escapeHtml(errorDesc || "")}</p>` +
-              `<p>You can close this window and try again.</p></body>`
-            );
-            cleanup();
-            rejectCapture(new Error(`external_idp callback error: ${error}`));
-            return;
-          }
-          if (!code || !state) {
-            res.statusCode = 400;
-            res.end("Missing code or state");
-            return;
-          }
-          if (expectedState && state !== expectedState) {
-            res.statusCode = 400;
-            res.setHeader("Content-Type", "text/html; charset=utf-8");
-            res.end(
-              `<!doctype html><meta charset="utf-8"><title>9router — State mismatch</title>` +
-              `<body style="font-family:system-ui;padding:2rem">` +
-              `<h1>State mismatch</h1><p>This sign-in attempt does not match an active 9router session. You can close this window.</p></body>`
-            );
-            cleanup();
-            rejectCapture(new Error("external_idp state mismatch"));
-            return;
-          }
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "text/html; charset=utf-8");
-          res.end(
-            `<!doctype html><meta charset="utf-8"><title>9router — Signed in</title>` +
-            `<body style="font-family:system-ui;padding:2rem;max-width:40rem;margin:auto">` +
-            `<h1>Signed in to 9router</h1><p>You can close this window and return to 9router.</p>` +
-            `<script>setTimeout(()=>window.close(),1500)</script></body>`
-          );
-          cleanup();
-          resolveCapture({ code, state });
-        } catch (err) {
-          try { res.statusCode = 500; res.end("Internal error"); } catch {}
-          cleanup();
-          rejectCapture(err);
-        }
-      });
-
-      timeoutHandle = setTimeout(() => {
-        cleanup();
-        rejectCapture(new Error("external_idp loopback capture timed out"));
-      }, timeoutMs);
-
-      server.once("error", (err) => {
-        cleanup();
-        rejectCapture(err);
-      });
-
-      server.listen(port, host, () => {
-        // Listening; resolveCapture stays pending until callback fires.
-      });
-    });
-
-    function cleanup() {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      timeoutHandle = null;
-      if (server) {
-        try { server.close(); } catch {}
-        server = null;
-      }
-    }
-
-    function cancel() {
-      cleanup();
-      rejectCapture(new Error("external_idp loopback capture cancelled"));
-    }
-
-    return { promise, cancel };
-  }
-
-  /**
    * Validate and import refresh token
    */
   async validateImportToken(refreshToken) {
@@ -519,20 +260,13 @@ export class KiroService {
   }
 
   /**
-   * List available CodeWhisperer profiles for a token (or API key) and return
-   * the best-matching profileArn. AWS SSO OIDC logins return no profileArn, so
-   * it must be fetched separately — the same call works for API-key auth.
-   * Accepts both `arn` and `profileArn` response field names (the API-key
-   * JSON-1.0 surface returns `arn`).
+   * List available CodeWhisperer profiles for OAuth/IDC tokens and return the
+   * best-matching profileArn. API keys use the Amazon Q model catalog instead;
+   * ListAvailableProfiles does not support TokenType=API_KEY.
    */
-  async listAvailableProfiles(accessToken, region = "us-east-1", options = {}) {
+  async listAvailableProfiles(accessToken, region = "us-east-1") {
     assertValidAwsRegion(region);
     const endpoint = `https://codewhisperer.${region}.amazonaws.com`;
-    const tokenTypeHeaders = options.authMethod === "external_idp"
-      ? { tokentype: "EXTERNAL_IDP" }
-      : options.authMethod === "api_key"
-        ? { tokentype: "API_KEY" }
-        : {};
 
     const response = await fetch(endpoint, {
       method: "POST",
@@ -541,7 +275,6 @@ export class KiroService {
         "x-amz-target": "AmazonCodeWhispererService.ListAvailableProfiles",
         "Authorization": `Bearer ${accessToken}`,
         "Accept": "application/json",
-        ...tokenTypeHeaders,
       },
       body: JSON.stringify({ maxResults: 10 }),
     });
@@ -559,10 +292,41 @@ export class KiroService {
   }
 
   /**
-   * Validate an API-key credential by listing profiles with it. API keys are
-   * long-lived bearer tokens (no refresh), so the only way to validate one is
-   * to make an authenticated CodeWhisperer call. Returns a credential object
-   * ready to persist as a "kiro" connection with authMethod="api_key".
+   * Validate an API key against the Amazon Q model catalog. A bearer-only call
+   * to ListAvailableProfiles can return HTTP 200 with an empty list for an
+   * arbitrary key, so it is not proof that the key can run inference.
+   */
+  async listAvailableApiKeyModels(apiKey, region = "us-east-1") {
+    assertValidAwsRegion(region);
+    const params = new URLSearchParams({ origin: "AI_EDITOR" });
+    const endpoint = `https://q.${region}.amazonaws.com/ListAvailableModels?${params}`;
+    const response = await fetch(endpoint, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "TokenType": "API_KEY",
+        "Accept": "application/json",
+        "User-Agent": "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
+        "X-Amz-User-Agent": "aws-sdk-js/3.0.0 kiro-ide/1.0.0",
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Failed to list API-key models: ${error}`);
+    }
+
+    const data = await response.json();
+    const models = Array.isArray(data?.models) ? data.models : [];
+    if (models.length === 0) {
+      throw new Error("API key returned no available models");
+    }
+    return models;
+  }
+
+  /**
+   * Validate an API-key credential through the same Amazon Q surface used for
+   * inference. API keys are account-bound but do not require a profileArn.
    */
   async validateApiKey(apiKey, region = "us-east-1") {
     if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {
@@ -570,9 +334,8 @@ export class KiroService {
     }
     const trimmed = apiKey.trim();
 
-    let profileArn = null;
     try {
-      profileArn = await this.listAvailableProfiles(trimmed, region, { authMethod: "api_key" });
+      await this.listAvailableApiKeyModels(trimmed, region);
     } catch (error) {
       throw new Error(`API key validation failed: ${error.message}`);
     }
@@ -580,7 +343,7 @@ export class KiroService {
     return {
       accessToken: trimmed,
       refreshToken: null,
-      profileArn,
+      profileArn: null,
       region,
       authMethod: "api_key",
     };

@@ -4,18 +4,19 @@ import { useState } from "react";
 import PropTypes from "prop-types";
 import { Button, Badge, Input, Modal, Select } from "@/shared/components";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
+import { planBulkAdd } from "@/shared/utils/bulkAdd";
 
 const BULK_PLACEHOLDER = `name1|sk-key1\nname2|sk-key2\nsk-key-only-auto-named`;
 
-export default function AddApiKeyModal({ isOpen, provider, providerName, isCompatible, isAnthropic, authType, authHint, website, proxyPools, error, onSave, onBulkDone, onClose }) {
+export default function AddApiKeyModal({ isOpen, provider, providerName, isCompatible, isAnthropic, authType, authHint, website, proxyPools, error, existingNames, onSave, onBulkDone, onClose }) {
   const NONE_PROXY_POOL_VALUE = "__none__";
   const isOllamaLocal = provider === "ollama-local";
   const isCookie = authType === "cookie";
   const isXaiApiKey = provider === "xai" && !isCookie;
-  const credentialLabel = isCookie ? "Cookie Value" : "API Key";
+  const credentialLabel = isCookie ? "Cookie Value" : provider === "qoder" ? "Personal Access Token (PAT)" : "API Key";
   const credentialPlaceholder = isCookie
     ? (provider === "grok-web" ? "sso=xxxxx... or just the raw value" : "eyJhbGciOi...")
-    : (isXaiApiKey ? "xai-..." : "");
+    : (isXaiApiKey ? "xai-..." : provider === "qoder" ? "pt-..." : "");
 
   const isAzure = provider === "azure";
   const isCloudflareAi = provider === "cloudflare-ai";
@@ -43,7 +44,9 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
   const [saving, setSaving] = useState(false);
   const bulkPlaceholder = isCloudflareAi
     ? `name1|sk-key1|acc123456\nname2|sk-key2|def789012\nsk-key-only-auto-named`
-    : BULK_PLACEHOLDER;
+    : provider === "qoder"
+      ? `name1|pt-xxxxx\nname2|pt-yyyyy\npt-only-auto-named`
+      : BULK_PLACEHOLDER;
 
   const [mode, setMode] = useState("single"); // "single" | "bulk"
   const [bulkText, setBulkText] = useState("");
@@ -131,43 +134,44 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
   };
 
   const handleBulkSubmit = async () => {
-    const lines = bulkText.split("\n").map(l => l.trim()).filter(Boolean);
+    const lines = bulkText.split("\n");
     if (!lines.length) return;
-    if (isCompatible && !formData.defaultModel.trim()) {
-      setBulkResult({ success: 0, failed: 0, error: "Default model is required for compatible providers" });
-      return;
-    }
+    // Plan collision-free names against existing connections so a generated
+    // "Key N" never matches a saved name (which the backend would upsert /
+    // overwrite instead of inserting). See bulkAdd.js for the full rationale.
+    const plan = planBulkAdd(lines, existingNames, { isCloudflareAi });
+    if (!plan.length) return;
     setSaving(true);
     setBulkResult(null);
     let success = 0;
     let failed = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const parts = lines[i].split("|");
-      const baseName = parts.length >= 2 ? parts[0].trim() : "Key";
-      const name = `${baseName} ${i + 1}`;
-
-      let apiKey;
-      let providerSpecificData;
-      if (isCloudflareAi && parts.length >= 3) {
-        // Format: name|apiKey|accountId
-        apiKey = parts.slice(1, -1).join("|").trim();
-        providerSpecificData = { accountId: parts[parts.length - 1].trim() };
-      } else {
-        apiKey = parts.length >= 2 ? parts.slice(1).join("|").trim() : parts[0].trim();
-      }
-
+    for (const entry of plan) {
       try {
+        // Validate each key before saving so bulk-added connections get a
+        // real status (active/unknown) like single adds, instead of a
+        // hardcoded "unknown" that never flips until a manual test.
+        let isValid = false;
+        try {
+          const vres = await fetch("/api/providers/validate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ provider, apiKey: entry.apiKey }),
+          });
+          const vdata = await vres.json().catch(() => ({}));
+          isValid = !!vdata.valid;
+        } catch {
+          isValid = false;
+        }
         const res = await fetch("/api/providers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             provider,
-            apiKey,
-            name,
+            apiKey: entry.apiKey,
+            name: entry.name,
             priority: 1,
-            testStatus: "unknown",
-            defaultModel: isCompatible ? formData.defaultModel.trim() : undefined,
-            ...(providerSpecificData ? { providerSpecificData } : {}),
+            testStatus: isValid ? "active" : "unknown",
+            ...(entry.providerSpecificData ? { providerSpecificData: entry.providerSpecificData } : {}),
           }),
         });
         if (res.ok) success++;
@@ -197,28 +201,18 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
             <p className="text-xs text-text-muted">
               {isCloudflareAi
                 ? <>One key per line. Format: <code>name|apiKey|accountId</code> or just <code>apiKey</code> (auto-named by index).</>
-                : <>One key per line. Format: <code>name|apiKey</code> or just <code>apiKey</code> (auto-named by index).</>
+                : provider === "qoder"
+                  ? <>One PAT per line. Format: <code>name|pt-...</code> or just <code>pt-...</code> (auto-named by index).</>
+                  : <>One key per line. Format: <code>name|apiKey</code> or just <code>apiKey</code> (auto-named by index).</>
               }
             </p>
-            {isCompatible && (
-              <input
-                type="text"
-                value={formData.defaultModel}
-                onChange={(e) => setFormData({ ...formData, defaultModel: e.target.value })}
-                placeholder="Default model (required)"
-                className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm"
-              />
-            )}
             <textarea
               className="w-full rounded border border-accent/30 bg-sidebar p-2 text-sm font-mono resize-y min-h-[140px] focus:outline-none focus:ring-1 focus:ring-primary"
               placeholder={bulkPlaceholder}
               value={bulkText}
               onChange={(e) => setBulkText(e.target.value)}
             />
-            {bulkResult && bulkResult.error && (
-              <p className="text-xs text-red-500 break-words">{bulkResult.error}</p>
-            )}
-            {bulkResult && !bulkResult.error && (
+            {bulkResult && (
               <div className={`text-sm font-medium ${bulkResult.failed > 0 ? "text-yellow-400" : "text-green-400"}`}>
                 ✓ {bulkResult.success} added{bulkResult.failed > 0 ? `, ✗ ${bulkResult.failed} failed` : ""}
               </div>
@@ -426,6 +420,7 @@ AddApiKeyModal.propTypes = {
     name: PropTypes.string,
   })),
   error: PropTypes.string,
+  existingNames: PropTypes.arrayOf(PropTypes.string),
   onSave: PropTypes.func.isRequired,
   onBulkDone: PropTypes.func,
   onClose: PropTypes.func.isRequired,
