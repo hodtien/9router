@@ -136,10 +136,6 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
   const handleBulkSubmit = async () => {
     const lines = bulkText.split("\n");
     if (!lines.length) return;
-    if (isCompatible && !formData.defaultModel.trim()) {
-      setBulkResult({ success: 0, failed: 0, error: "Default model is required for compatible providers" });
-      return;
-    }
     // Plan collision-free names against existing connections so a generated
     // "Key N" never matches a saved name (which the backend would upsert /
     // overwrite instead of inserting). See bulkAdd.js for the full rationale.
@@ -175,7 +171,6 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
             name: entry.name,
             priority: 1,
             testStatus: isValid ? "active" : "unknown",
-            defaultModel: isCompatible ? formData.defaultModel.trim() : undefined,
             ...(entry.providerSpecificData ? { providerSpecificData: entry.providerSpecificData } : {}),
           }),
         });
@@ -211,25 +206,13 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
                   : <>One key per line. Format: <code>name|apiKey</code> or just <code>apiKey</code> (auto-named by index).</>
               }
             </p>
-            {isCompatible && (
-              <input
-                type="text"
-                value={formData.defaultModel}
-                onChange={(e) => setFormData({ ...formData, defaultModel: e.target.value })}
-                placeholder="Default model (required)"
-                className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm"
-              />
-            )}
             <textarea
               className="w-full rounded border border-accent/30 bg-sidebar p-2 text-sm font-mono resize-y min-h-[140px] focus:outline-none focus:ring-1 focus:ring-primary"
               placeholder={bulkPlaceholder}
               value={bulkText}
               onChange={(e) => setBulkText(e.target.value)}
             />
-            {bulkResult && bulkResult.error && (
-              <p className="text-xs text-red-500 break-words">{bulkResult.error}</p>
-            )}
-            {bulkResult && !bulkResult.error && (
+            {bulkResult && (
               <div className={`text-sm font-medium ${bulkResult.failed > 0 ? "text-yellow-400" : "text-green-400"}`}>
                 ✓ {bulkResult.success} added{bulkResult.failed > 0 ? `, ✗ ${bulkResult.failed} failed` : ""}
               </div>
