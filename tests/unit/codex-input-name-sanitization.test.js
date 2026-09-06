@@ -119,4 +119,19 @@ describe("CodexExecutor input item name sanitization", () => {
     expect(body.input[0].name).toBe("legacy_tool");
     expect(body.tools).toBeUndefined();
   });
+
+  it("truncates overlong names to 128 chars and keeps valid prefix", () => {
+    const long = "a".repeat(309);
+    const longDotted = ("namespace." + "x".repeat(309));
+    const body = run([
+      { type: "function_call", call_id: "c1", name: long, arguments: "{}" },
+      { type: "custom_tool_call", call_id: "c2", name: longDotted, input: "..." },
+    ]);
+    expect(body.input[0].name).toBe(long.slice(0, 128));
+    expect(body.input[1].name).toBe(("namespace_" + "x".repeat(309)).slice(0, 128));
+    for (const item of body.input) {
+      expect(item.name.length).toBeLessThanOrEqual(128);
+      expect(/^[a-zA-Z0-9_-]+$/.test(item.name)).toBe(true);
+    }
+  });
 });

@@ -28,14 +28,19 @@ const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try 
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
 
-// Codex /responses rejects any input item whose `name` violates ^[a-zA-Z0-9_-]+$.
-// Replace offending characters with `_` so historical function_call / custom_tool_call
-// names from upstream providers (MCP, Claude tool names with dots/colon, unicode) pass.
+// Codex /responses rejects any input item whose `name` violates ^[a-zA-Z0-9_-]+$
+// and caps length at 128 chars. Replace offending characters with `_` and
+// truncate so historical function_call / custom_tool_call names from upstream
+// providers (MCP, Claude tool names with dots/colon, unicode, long slugs) pass.
 const CODEX_NAME_INVALID_CHARS = /[^a-zA-Z0-9_-]/g;
 const CODEX_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const CODEX_NAME_MAX_LEN = 128;
 function sanitizeCodexName(raw) {
   if (typeof raw !== "string") return "";
-  return raw.trim().replace(CODEX_NAME_INVALID_CHARS, "_");
+  const cleaned = raw.trim().replace(CODEX_NAME_INVALID_CHARS, "_");
+  return cleaned.length > CODEX_NAME_MAX_LEN
+    ? cleaned.slice(0, CODEX_NAME_MAX_LEN)
+    : cleaned;
 }
 
 // Hosted tool types that Codex/OpenAI Responses executes server-side
