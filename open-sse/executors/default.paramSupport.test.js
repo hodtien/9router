@@ -53,3 +53,27 @@ test("DefaultExecutor strips fugu reasoning_effort=low (Sakana allow-list)", () 
   const out = executor.transformRequest("fugu-ultra", body);
   assert.equal(out.reasoning_effort, undefined);
 });
+
+test("DefaultExecutor clamps max_tokens for qwen3.8 below the floor", () => {
+  // Claude Code /model probe sends max_tokens:1; upstream bai/qwen3.8-flash
+  // requires > 2. Wire enforceParamMinimums into the executor.
+  const executor = new DefaultExecutor("openai-compatible-chat-bai");
+  const body = {
+    model: "qwen3.8-flash",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "hi" }],
+  };
+  const out = executor.transformRequest("qwen3.8-flash", body);
+  assert.equal(out.max_tokens, 3);
+});
+
+test("DefaultExecutor leaves max_tokens alone for non-qwen3.8 models", () => {
+  const executor = new DefaultExecutor("openai-compatible-chat-x");
+  const body = {
+    model: "some-other-model",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "hi" }],
+  };
+  const out = executor.transformRequest("some-other-model", body);
+  assert.equal(out.max_tokens, 1);
+});

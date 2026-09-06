@@ -45,6 +45,29 @@ test("fugu-ultra: leaves max_tokens undefined alone", () => {
   assert.equal(body.max_tokens, undefined);
 });
 
+// ---------- qwen3.8 (openai-compatible "bai" / similar nodes) ----------
+// Upstream rejects max_tokens <= 2 with "max_tokens must be greater than 2".
+// Claude Code's /model probe sends max_tokens:1, so the gateway must clamp.
+
+test("qwen3.8: bumps max_tokens from 1 to floor 3", () => {
+  const body = { model: "qwen3.8-flash", max_tokens: 1 };
+  enforceParamMinimums("openai-compatible-chat-bai", "qwen3.8-flash", body);
+  assert.equal(body.max_tokens, 3);
+});
+
+test("qwen3.8: leaves max_tokens alone when already above floor", () => {
+  const body = { model: "qwen3.8-flash", max_tokens: 8000 };
+  enforceParamMinimums("openai-compatible-chat-bai", "qwen3.8-flash", body);
+  assert.equal(body.max_tokens, 8000);
+});
+
+test("qwen3.8: bumps max_completion_tokens and max_output_tokens fields", () => {
+  const body = { model: "qwen3.8-flash", max_completion_tokens: 2, max_output_tokens: 1 };
+  enforceParamMinimums("openai-compatible-chat-bai", "qwen3.8-flash", body);
+  assert.equal(body.max_completion_tokens, 3);
+  assert.equal(body.max_output_tokens, 3);
+});
+
 test("fugu-ultra: strips reasoning_effort=low (not in Sakana allow-list)", () => {
   const body = { model: "fugu-ultra", reasoning_effort: "low" };
   stripUnsupportedParams("openai-compatible-chat-x", "fugu-ultra", body);

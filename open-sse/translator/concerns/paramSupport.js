@@ -55,6 +55,14 @@ const MIN_RULES = [
     match: /(^|\/)fugu(-ultra)?(-[0-9]+)?$/i,
     min: { max_tokens: 16, max_completion_tokens: 16, max_output_tokens: 16 },
   },
+  // Qwen3.8 (e.g. via openai-compatible "bai" nodes): rejects max_tokens <= 2
+  // ("max_tokens must be greater than 2"). Claude Code's /model probe sends
+  // max_tokens:1, which is valid for Anthropic but 400s here. Model-id match
+  // covers any compatible node routing qwen3.8 upstream.
+  {
+    match: /qwen3\.8/i,
+    min: { max_tokens: 3, max_completion_tokens: 3, max_output_tokens: 3 },
+  },
   { provider: "volcengine-ark", match: /glm-5/i, clampToModelMaxOutput: true },
   // VolcEngine Ark caps the Kimi family at max_tokens <= 32768, but the model's
   // advertised ceiling is far higher (Kimi-K2.7-Code resolves to maxOutput 262144),
