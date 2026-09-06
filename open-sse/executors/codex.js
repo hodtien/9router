@@ -28,6 +28,16 @@ const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try 
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
 
+// Codex /responses rejects any input item whose `name` violates ^[a-zA-Z0-9_-]+$.
+// Replace offending characters with `_` so historical function_call / custom_tool_call
+// names from upstream providers (MCP, Claude tool names with dots/colon, unicode) pass.
+const CODEX_NAME_INVALID_CHARS = /[^a-zA-Z0-9_-]/g;
+const CODEX_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+function sanitizeCodexName(raw) {
+  if (typeof raw !== "string") return "";
+  return raw.trim().replace(CODEX_NAME_INVALID_CHARS, "_");
+}
+
 // Hosted tool types that Codex/OpenAI Responses executes server-side
 const CODEX_HOSTED_TOOL_TYPES = new Set([
   "image_generation", "web_search", "web_search_preview", "file_search",
@@ -410,6 +420,19 @@ export class CodexExecutor extends BaseExecutor {
     stripStoredItemReferences(body);
     // Flatten function tools + drop unsupported types
     normalizeCodexTools(body);
+
+    // Codex /responses requires every input item's `name` to match ^[a-zA-Z0-9_-]+$.
+    // Rewrite only offending names on historical function_call / custom_tool_call items;
+    // tool definitions, tool_choice and call_id stay intact (dispatch is by call_id).
+    if (Array.isArray(body.input)) {
+      for (const item of body.input) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        if (item.type !== "function_call" && item.type !== "custom_tool_call") continue;
+        if (typeof item.name !== "string") continue;
+        const safe = sanitizeCodexName(item.name);
+        if (safe && safe !== item.name) item.name = safe;
+      }
+    }
 
     // Ensure streaming is enabled (Codex API requires it)
     body.stream = true;
