@@ -1,0 +1,32 @@
+{
+  "name": "groxy",
+  "version": "0.1.0",
+  "description": "Groxy CLI - local AI routing gateway (fork of 9router)",
+  "bin": {
+    "groxy": "./cli.js"
+  },
+  "files": [
+    "cli.js",
+    "scripts/copy-from-9router.mjs",
+    "hooks",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "copy": "node scripts/copy-from-9router.mjs",
+    "postinstall": "node hooks/postinstall.js"
+  },
+  "comment_data_dir": "State lives under ~/.groxy by default (override via GROXY_DATA_DIR). Runtime deps + SQLite are installed into ~/.groxy/runtime/node_modules.",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "groxy",
+    "9router",
+    "cli",
+    "proxy",
+    "ai",
+    "api"
+  ],
+  "license": "MIT"
+}
