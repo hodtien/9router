@@ -1,4 +1,4 @@
-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
+import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS, TERMINAL_ERROR_PATTERNS } from "../config/errorConfig.js";
 
 /**
  * Calculate exponential backoff cooldown for rate limits (429)
@@ -24,6 +24,14 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
   const lowerError = errorText
     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
     : "";
+
+  // Deterministic request-shape errors: rotating to another account would
+  // fail the same way, so surface them to the client without locking.
+  for (const pattern of TERMINAL_ERROR_PATTERNS) {
+    if (lowerError.includes(pattern)) {
+      return { shouldFallback: false, cooldownMs: 0 };
+    }
+  }
 
   for (const rule of ERROR_RULES) {
     // Text-based rule: match substring in error message

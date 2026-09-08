@@ -41,6 +41,15 @@ export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
 // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
 export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
 
+// Error messages that should never trigger account fallback: they are
+// deterministic request-size / parameter errors, so rotating to another
+// account would fail the same way. Surface them to the client instead.
+export const TERMINAL_ERROR_PATTERNS = [
+  "content length exceeds threshold",
+  "input is too long",
+  "context length exceeded",
+];
+
 // Cooldown durations (ms)
 const COOLDOWN = {
   long: 2 * 60 * 1000,
