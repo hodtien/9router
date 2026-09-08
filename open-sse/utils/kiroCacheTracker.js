@@ -233,17 +233,79 @@ function flattenClaudeCacheBlocks(req) {
   return blocks;
 }
 
+// Responses-API (openai-responses source format) equivalent. Every input item
+// is fingerprinted; each turn boundary (last item of a message/function_call
+// group) is an implicit 5m breakpoint so resumed sessions can hit earlier
+// stored prefixes. No cache_control exists in this format — all TTLs implicit.
+function flattenResponsesCacheBlocks(req) {
+  const blocks = [];
+
+  const prelude = {
+    kind: "request_prelude",
+    model: req.model,
+    instructions: req.instructions ?? null,
+    tool_choice: req.tool_choice ?? null,
+  };
+  blocks.push({ value: prelude, tokens: estimateApproxTokens(canonicalizeCacheValue(prelude)), ttl: 0, isMessageEnd: false });
+
+  (req.tools || []).forEach((tool, toolIndex) => {
+    const toolValue = {
+      kind: "tool",
+      tool_index: toolIndex,
+      type: tool?.type,
+      name: tool?.name ?? tool?.function?.name,
+      description: tool?.description ?? tool?.function?.description,
+      parameters: tool?.parameters ?? tool?.function?.parameters,
+    };
+    const fingerprintValue = stripCachePositionKeys(toolValue);
+    blocks.push({
+      value: fingerprintValue,
+      tokens: estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
+      ttl: 0,
+      isMessageEnd: false,
+    });
+  });
+
+  const items = Array.isArray(req.input) ? req.input : [];
+  items.forEach((item, itemIndex) => {
+    const itemType = typeof item?.type === "string" ? item.type : "message";
+    const isTurnEnd = itemIndex === items.length - 1;
+    const fingerprintValue = stripCachePositionKeys({
+      kind: "response_item",
+      item_index: itemIndex,
+      type: itemType,
+      role: item?.role,
+      name: item?.name,
+      call_id: item?.call_id,
+      content: item?.content,
+      arguments: item?.arguments,
+      output: item?.output,
+    });
+    blocks.push({
+      value: fingerprintValue,
+      tokens: estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
+      ttl: 0,
+      isMessageEnd: isTurnEnd,
+    });
+  });
+
+  return blocks;
+}
+
 /**
- * Build a prompt-cache profile from a Claude request. Returns null when there
- * are no cache_control breakpoints (nothing to account for).
+ * Build a prompt-cache profile from a Claude or openai-responses request.
+ * Returns null when there are no breakpoints (nothing to account for).
  *
- * @param {object} req - Claude-format request body
+ * @param {object} req - Claude-format or Responses-format request body
  * @param {number} totalInputTokens - reported input tokens for the request
  * @returns {{breakpoints: Array<{fingerprint:string, cumulativeTokens:number, ttl:number}>, totalInputTokens:number, model:string}|null}
  */
 export function buildClaudeCacheProfile(req, totalInputTokens) {
   if (!req || typeof req !== "object") return null;
-  const blocks = flattenClaudeCacheBlocks(req);
+  // Responses-format bodies carry input[]/instructions; Claude bodies carry
+  // messages[]/system (+cache_control). Route to the matching flatten pass.
+  const isResponses = Array.isArray(req.input) && !Array.isArray(req.messages);
+  const blocks = isResponses ? flattenResponsesCacheBlocks(req) : flattenClaudeCacheBlocks(req);
   if (blocks.length === 0) return null;
 
   const hasher = createHash("sha256");
@@ -261,6 +323,10 @@ export function buildClaudeCacheProfile(req, totalInputTokens) {
       activeTTL = block.ttl;
     } else if (block.isMessageEnd && activeTTL > 0) {
       breakpointTTL = activeTTL;
+    } else if (block.isMessageEnd && isResponses) {
+      // Responses format has no cache_control: every turn boundary is an
+      // implicit 5m breakpoint so resumed sessions can hit stored prefixes.
+      breakpointTTL = DEFAULT_PROMPT_CACHE_TTL_MS;
     }
     if (breakpointTTL <= 0) continue;
 
@@ -399,7 +465,10 @@ export const defaultKiroCacheTracker = new KiroCacheTracker();
 export function applyKiroCacheAccounting({ provider, sourceFormat, body, model, connectionId, usage, tracker = defaultKiroCacheTracker, now = Date.now() }) {
   if (!usage || typeof usage !== "object") return usage;
   if (provider !== "kiro") return usage;
-  if (sourceFormat !== FORMATS.CLAUDE) return usage;
+  // Claude requests carry explicit cache_control breakpoints; Responses-format
+  // requests (openai-responses, e.g. the /v1/responses entry) get implicit
+  // per-turn breakpoints. Other formats have no cacheable prefix model.
+  if (sourceFormat !== FORMATS.CLAUDE && sourceFormat !== FORMATS.OPENAI_RESPONSES) return usage;
   if (!connectionId) return usage;
 
   // Respect real upstream cache data if it ever appears — never override it with
