@@ -2,9 +2,58 @@ import { getProviderConnections, validateApiKey, updateProviderConnection, getSe
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
-import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
+import { resolveProviderId, getProviderAlias, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
+
+/**
+ * Returns true when the connection can serve the requested model.
+ * A connection is eligible when:
+ *  - it has no `allowedModels` field
+ *  - it has an empty `allowedModels` array
+ *  - its `allowedModels` array contains a bare `model`, or a prefixed
+ *    `${prefix}/${model}` entry whose prefix identifies this provider.
+ *
+ * The model argument is the canonical model identifier used at routing time,
+ * and `provider` is the canonical provider id. The UI, however, persists
+ * whitelist entries with a *display* prefix, which can be any of:
+ *  - the canonical provider id      (e.g. "kilocode/…")
+ *  - the provider's uiAlias         (e.g. "kc/…", what ModelSelectModal writes)
+ *  - a custom connection prefix      (e.g. "zm/…" for openai/anthropic-compatible)
+ * so all three are accepted, case-sensitively, to keep old and new stored
+ * values working without a data migration.
+ *
+ * When model is null/undefined, the filter is a no-op (returns true) because
+ * no comparison can be made.
+ *
+ * @param {object} connection
+ * @param {string|null|undefined} model
+ * @param {string|null|undefined} provider
+ * @returns {boolean}
+ */
+export function isConnectionAllowedForModel(connection, model, provider = null) {
+  if (!model) return true;
+  const list = connection?.allowedModels;
+  if (!Array.isArray(list) || list.length === 0) return true;
+
+  const acceptablePrefixes = new Set();
+  if (provider) {
+    acceptablePrefixes.add(provider);
+    const alias = getProviderAlias(provider);
+    if (alias) acceptablePrefixes.add(alias);
+  }
+  const customPrefix = connection?.providerSpecificData?.prefix;
+  if (customPrefix) acceptablePrefixes.add(customPrefix);
+
+  return list.some((allowedModel) => {
+    if (allowedModel === model) return true;
+    const slash = typeof allowedModel === "string" ? allowedModel.indexOf("/") : -1;
+    if (slash === -1) return false;
+    const prefix = allowedModel.slice(0, slash);
+    const remainder = allowedModel.slice(slash + 1);
+    return remainder === model && acceptablePrefixes.has(prefix);
+  });
+}
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
@@ -31,6 +80,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
+  const bypassModelWhitelist = options?.bypassModelWhitelist === true;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -81,10 +131,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const isAntigravity = providerId === "antigravity";
     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
 
-    // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
+    // Filter out excluded, model-locked, whitelist-mismatched, and Antigravity quota-exhausted connections.
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
+      if (!bypassModelWhitelist && !isConnectionAllowedForModel(c, model, providerId)) return false;
       // Antigravity: skip if live quota exhausted for this model
       if (isAntigravity && model && antigravityQuotaCache) {
         const quota = antigravityQuotaCache.get(c.id)?.[model];
@@ -101,9 +152,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     connections.forEach(c => {
       const excluded = excludeSet.has(c.id);
       const locked = isModelLockActive(c, model);
-      if (excluded || locked) {
+      const notWhitelisted = !bypassModelWhitelist && !isConnectionAllowedForModel(c, model, providerId);
+      if (excluded || locked || notWhitelisted) {
         const lockUntil = getEarliestModelLockUntil(c);
-        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""}`);
+        log.debug("AUTH", `  → ${c.id?.slice(0, 8)} | ${excluded ? "excluded" : ""} ${locked ? `modelLocked(${model}) until ${lockUntil}` : ""} ${notWhitelisted ? `whitelist-miss(${model})` : ""}`);
       }
     });
 
@@ -272,7 +324,11 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     lastError: reason,
     errorCode: status,
     lastErrorAt: new Date().toISOString(),
-    backoffLevel: newBackoffLevel ?? backoffLevel
+    backoffLevel: newBackoffLevel ?? backoffLevel,
+    // Reset sticky counter so the failing account isn't picked again before
+    // its lock expires — round-robin sorts by lastUsedAt, and a fresh
+    // lastUsedAt would otherwise keep this account at the front.
+    consecutiveUseCount: 0,
   });
 
   const lockKey = Object.keys(lockUpdate)[0];

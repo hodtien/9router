@@ -12,6 +12,9 @@ import {
   getHiddenQuotaRows,
   getQuotaVisibilityKey,
   getConnectionLabel,
+  maskAccountIdentity,
+  getAccountTypeLabel,
+  getPlanLabel,
   getConnectionQuotaRemaining,
   sortVisibleConnections,
   buildLoadingState,
@@ -32,6 +35,7 @@ import {
   CLAUDE_REFRESH_INTERVAL_MS,
   DEPLETED_QUOTA_THRESHOLD,
   AUTO_REFRESH_STORAGE_KEY,
+  HIDE_ACCOUNT_IDENTITY_STORAGE_KEY,
   CONNECTIONS_PAGE_SIZE,
   ACCOUNT_PAGE_SIZE_OPTIONS,
   ACCOUNT_PAGE_SIZE_MAX,
@@ -43,18 +47,6 @@ import { ConfirmModal, EditConnectionModal } from "@/shared/components";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 
-// Maps the stored providerSpecificData.authMethod to a human label for Kiro.
-// Values come from the Kiro connect flows: builder-id/idc (device code),
-// google/github (social), imported (refresh-token paste), api_key (headless).
-const KIRO_METHOD_LABELS = {
-  "builder-id": "AWS Builder ID",
-  idc: "IAM Identity Center",
-  google: "Google",
-  github: "GitHub",
-  imported: "Imported Token",
-  api_key: "API Key",
-};
-
 const AUTO_PING_SETTINGS_KEYS = {
   claude: "claudeAutoPing",
   codex: "codexAutoPing",
@@ -65,22 +57,15 @@ const AUTO_PING_TOOLTIPS = {
   codex: "Auto-starts the next 5h Codex window after reset by sending a tiny gpt-5.5 request. Consumes a small amount of quota.",
 };
 
-function kiroMethodLabel(conn) {
-  const m = conn.providerSpecificData?.authMethod;
-  if (m && KIRO_METHOD_LABELS[m]) return KIRO_METHOD_LABELS[m];
-  return conn.authType === "api_key" ? "API Key" : "OAuth";
-}
-
-function getConnectionSecondaryLabel(connection) {
+function getConnectionSecondaryLabel(connection, options = {}) {
+  let label = null;
   if (connection.name?.trim() && connection.email?.trim() && connection.name.trim() !== connection.email.trim()) {
-    return connection.email.trim();
+    label = connection.email.trim();
+  } else if (connection.name?.trim() && connection.displayName?.trim() && connection.name.trim() !== connection.displayName.trim()) {
+    label = connection.displayName.trim();
   }
 
-  if (connection.name?.trim() && connection.displayName?.trim() && connection.name.trim() !== connection.displayName.trim()) {
-    return connection.displayName.trim();
-  }
-
-  return null;
+  return options.hideIdentity ? maskAccountIdentity(label) : label;
 }
 
 // Region is stored for builder-id/idc/api_key flows; social and imported flows
@@ -131,9 +116,11 @@ export default function ProviderLimits() {
   const [loading, setLoading] = useState({});
   const [errors, setErrors] = useState({});
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [hideAccountIdentity, setHideAccountIdentity] = useState(false);
   const [autoPingMaps, setAutoPingMaps] = useState({ claude: {}, codex: {} });
   const [lastUpdated, setLastUpdated] = useState(null);
   const [hasHydratedAutoRefresh, setHasHydratedAutoRefresh] = useState(false);
+  const [hasHydratedHideIdentity, setHasHydratedHideIdentity] = useState(false);
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [countdown, setCountdown] = useState(60);
   const [connectionsLoading, setConnectionsLoading] = useState(true);
@@ -536,6 +523,22 @@ export default function ProviderLimits() {
     if (typeof window === "undefined" || !hasHydratedAutoRefresh) return;
     window.localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, String(autoRefresh));
   }, [autoRefresh, hasHydratedAutoRefresh]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setHideAccountIdentity(
+      window.localStorage.getItem(HIDE_ACCOUNT_IDENTITY_STORAGE_KEY) === "true",
+    );
+    setHasHydratedHideIdentity(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasHydratedHideIdentity) return;
+    window.localStorage.setItem(
+      HIDE_ACCOUNT_IDENTITY_STORAGE_KEY,
+      String(hideAccountIdentity),
+    );
+  }, [hideAccountIdentity, hasHydratedHideIdentity]);
 
   // Load auto-ping per-connection maps
   useEffect(() => {
@@ -1016,6 +1019,22 @@ export default function ProviderLimits() {
             )}
           </button>
 
+          {/* Account identity privacy toggle */}
+          <button
+            type="button"
+            onClick={() => setHideAccountIdentity((prev) => !prev)}
+            aria-pressed={hideAccountIdentity}
+            aria-label={hideAccountIdentity ? "Show account names and emails" : "Hide account names and emails"}
+            className={`flex h-8 shrink-0 items-center gap-1 rounded-lg border px-2 text-xs transition-colors ${hideAccountIdentity ? "border-primary/40 bg-primary/10 text-primary" : "border-black/10 text-text-primary hover:bg-black/5 dark:border-white/10 dark:hover:bg-white/5"}`}
+            title={hideAccountIdentity ? "Show account names and emails" : "Hide account names and emails"}
+          >
+            <span aria-hidden="true" className="material-symbols-outlined text-[14px]">
+              {hideAccountIdentity ? "visibility_off" : "visibility"}
+            </span>
+            <span className="hidden sm:inline">
+              {hideAccountIdentity ? "Show names" : "Hide names"}
+            </span>
+          </button>
 
           {/* Refresh all button */}
           <button
@@ -1051,6 +1070,9 @@ export default function ProviderLimits() {
           // Use table layout for all providers
           const isInactive = conn.isActive === false;
           const isCodex = conn.provider === "codex";
+          const planLabel = getPlanLabel(
+            quota?.plan || conn.providerSpecificData?.chatgptPlanType || conn.providerSpecificData?.plan,
+          );
           const resetCreditCount = getCodexResetCreditCount(quota);
           const isResettingLimit = resettingLimitId === conn.id;
           const rowBusy = deletingId === conn.id || togglingId === conn.id || isResettingLimit;
@@ -1079,42 +1101,36 @@ export default function ProviderLimits() {
                       />
                     </div>
                     <div className="min-w-0">
-                      <h3 className="text-sm font-semibold text-text-primary capitalize truncate">
-                        {conn.provider}
-                      </h3>
-                      {getConnectionLabel(conn) ? (
-                        <p className="text-xs text-text-muted truncate">
-                          {getConnectionLabel(conn)}
-                        </p>
-                      ) : null}
-                      {getConnectionSecondaryLabel(conn) ? (
-                        <p className="text-[11px] text-text-muted/80 truncate">
-                          {getConnectionSecondaryLabel(conn)}
-                        </p>
-                      ) : null}
-                      {conn.provider === "kiro" && (
-                        <div className="mt-1 flex flex-wrap items-center gap-1">
-                          <span className="rounded-full bg-brand-500/10 px-2 py-0.5 text-[10px] font-semibold text-brand-600 dark:text-brand-300">
-                            {kiroMethodLabel(conn)}
+                      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                        <h3 className="text-xs font-semibold text-text-primary capitalize truncate">
+                          {conn.provider}
+                        </h3>
+                        <span className="rounded-full bg-brand-500/10 px-2 py-0.5 text-[10px] font-semibold text-brand-600 dark:text-brand-300">
+                          {getAccountTypeLabel(conn)}
+                        </span>
+                        {planLabel && (
+                          <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                            {planLabel}
                           </span>
+                        )}
+                      </div>
+                      {getConnectionLabel(conn, { hideIdentity: hideAccountIdentity }) ? (
+                        <p className="text-xs text-text-muted truncate">
+                          {getConnectionLabel(conn, { hideIdentity: hideAccountIdentity })}
+                        </p>
+                      ) : null}
+                      {getConnectionSecondaryLabel(conn, { hideIdentity: hideAccountIdentity }) ? (
+                        <p className="text-[11px] text-text-muted/80 truncate">
+                          {getConnectionSecondaryLabel(conn, { hideIdentity: hideAccountIdentity })}
+                        </p>
+                      ) : null}
+                      {(conn.provider === "kiro" && (kiroRegion(conn) || conn.providerSpecificData?.profileArn)) && (
+                        <div className="mt-1 flex flex-wrap items-center gap-1">
                           {kiroRegion(conn) && (
                             <span className="rounded-full bg-blue-500/10 px-2 py-0.5 text-[10px] font-semibold text-blue-600 dark:text-blue-400">
                               {kiroRegion(conn)}
                             </span>
                           )}
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                              isInactive
-                                ? "bg-surface-2 text-text-muted"
-                                : conn.testStatus === "active" || conn.testStatus === "success"
-                                  ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                                  : conn.testStatus === "error" || conn.testStatus === "expired" || conn.testStatus === "unavailable"
-                                    ? "bg-red-500/10 text-red-600 dark:text-red-400"
-                                    : "bg-surface-2 text-text-muted"
-                            }`}
-                          >
-                            {isInactive ? "disabled" : conn.testStatus || "unknown"}
-                          </span>
                           {conn.providerSpecificData?.profileArn && (
                             <button
                               type="button"
@@ -1454,7 +1470,7 @@ export default function ProviderLimits() {
           setResetConfirmState(null);
         }}
         title="Reset Codex limit?"
-        message={`Use 1 Codex reset credit for ${getConnectionLabel(resetConfirmState?.connection || {}) || "this account"}. This cannot be undone. Remaining credits: ${resetConfirmState?.resetCreditCount ?? 0}.`}
+        message={`Use 1 Codex reset credit for ${getConnectionLabel(resetConfirmState?.connection || {}, { hideIdentity: hideAccountIdentity }) || "this account"}. This cannot be undone. Remaining credits: ${resetConfirmState?.resetCreditCount ?? 0}.`}
         confirmText="Reset limit"
         cancelText="Cancel"
         variant="danger"
@@ -1468,7 +1484,7 @@ export default function ProviderLimits() {
               <div className="min-w-0">
                 <h3 className="text-base font-semibold text-text-primary">Codex Reset Credit Expiry</h3>
                 <p className="mt-0.5 truncate text-xs text-text-muted">
-                  {getConnectionLabel(resetCreditsState.connection) || "Codex account"}
+                  {getConnectionLabel(resetCreditsState.connection, { hideIdentity: hideAccountIdentity }) || "Codex account"}
                 </p>
               </div>
               <button
