@@ -6,7 +6,7 @@ import { OAUTH_ENDPOINTS, buildKimiHeaders } from "../config/appConstants.js";
 import { buildClineHeaders } from "../shared/clineAuth.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
-import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
+import { stripUnsupportedParams, enforceParamMinimums } from "../translator/concerns/paramSupport.js";
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
 const BEARER = { combined: true, header: "Authorization", scheme: "bearer" };
@@ -76,6 +76,7 @@ export class DefaultExecutor extends BaseExecutor {
         delete transformed.client_metadata;
       }
       stripUnsupportedParams(this.provider, model, transformed);
+      enforceParamMinimums(this.provider, model, transformed);
     }
 
     return injectReasoningContent({ provider: this.provider, model, body: transformed });

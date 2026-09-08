@@ -7,7 +7,7 @@ import {
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
-import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../services/antigravityQuota.js";
+import { handleAntigravityQuotaError } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
@@ -20,10 +20,30 @@ import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActi
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+import { clientWantsStream, createKeepaliveSseResponse } from "open-sse/utils/earlySse.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
-import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
+import {
+  hasDiagnosticModelTestBypass,
+  CLI_TOKEN_HEADER,
+  MODEL_WHITELIST_BYPASS_HEADER,
+  MODEL_WHITELIST_BYPASS_NONCE_HEADER,
+} from "@/shared/utils/modelDiagnosticBypass";
+
+// Internal-only headers used to gate the diagnostic model-test bypass. They must
+// never reach request logging or the upstream provider — strip before forwarding.
+const INTERNAL_BYPASS_HEADERS = new Set([
+  CLI_TOKEN_HEADER,
+  MODEL_WHITELIST_BYPASS_HEADER,
+  MODEL_WHITELIST_BYPASS_NONCE_HEADER,
+]);
+
+function headersWithoutInternalBypass(headers) {
+  return Object.fromEntries(
+    [...headers.entries()].filter(([key]) => !INTERNAL_BYPASS_HEADERS.has(key.toLowerCase()))
+  );
+}
 
 /**
  * Handle chat completion request
@@ -45,14 +65,10 @@ export async function handleChat(request, clientRawRequest = null) {
     clientRawRequest = {
       endpoint: url.pathname,
       body,
-      headers: Object.fromEntries(request.headers.entries())
+      headers: headersWithoutInternalBypass(request.headers)
     };
   }
-  // Claude Code marks a 1M-context request as `<model>[1m]`; the marker matches
-  // no combo, alias or provider/model pair, so it must not reach resolution.
-  // The capability travels in the anthropic-beta header, forwarded as-is.
-  const { model: modelStr, contextMarker } = stripModelContextMarker(body.model);
-  if (contextMarker) body.model = modelStr;
+  const modelStr = body.model;
 
   // Request summary is emitted as the unified "▶" line in chatCore (has fmt/thinking/account)
 
@@ -102,40 +118,62 @@ export async function handleChat(request, clientRawRequest = null) {
     const augmentedModels = augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings);
     const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
-    if (comboStrategy === "fusion") {
-      log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
-      return handleFusionChat({
+    const runCombo = () => {
+      if (comboStrategy === "fusion") {
+        log.info("CHAT", `Combo "${modelStr}" with ${comboModels.length} models (strategy: fusion)`);
+        return handleFusionChat({
+          body,
+          models: comboModels,
+          handleSingleModel: (b, m, isPanel) => {
+            let cleanRawReq = clientRawRequest;
+            if (isPanel && clientRawRequest) {
+              const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
+              cleanRawReq = { ...clientRawRequest, body: cleanBody };
+            }
+            // no earlySse — combo needs real status for fallback
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          },
+          log,
+          comboName: modelStr,
+          judgeModel: comboStrategies[modelStr]?.judgeModel,
+          tuning: comboStrategies[modelStr]?.fusionTuning,
+        });
+      }
+
+      const comboStickyLimit = settings.comboStickyRoundRobinLimit;
+      log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
+      return handleComboChat({
         body,
-        models: comboModels,
-        handleSingleModel: (b, m, isPanel) => {
-          let cleanRawReq = clientRawRequest;
-          if (isPanel && clientRawRequest) {
-            const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
-            cleanRawReq = { ...clientRawRequest, body: cleanBody };
-          }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
-        },
+        models: augmentedModels,
+        handleSingleModel: withCapacityAdapterStripping(
+          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+          adapterAdded
+        ),
         log,
         comboName: modelStr,
-        judgeModel: comboStrategies[modelStr]?.judgeModel,
-        tuning: comboStrategies[modelStr]?.fusionTuning,
+        comboStrategy,
+        comboStickyLimit
+      });
+    };
+
+    // Client-facing combo: early SSE so CF doesn't 504 while first model + fallback runs
+    if (clientWantsStream(body)) {
+      return createKeepaliveSseResponse(async ({ writeError }) => {
+        const res = await runCombo();
+        if (res instanceof Response && res.status >= 400) {
+          let msg = `Combo error (${res.status})`;
+          try {
+            const t = await res.clone().text();
+            const j = JSON.parse(t);
+            msg = j?.error?.message || j?.message || msg;
+          } catch { /* keep msg */ }
+          writeError(msg, res.status);
+          return undefined;
+        }
+        return res;
       });
     }
-
-    const comboStickyLimit = settings.comboStickyRoundRobinLimit;
-    log.info("CHAT", `Combo "${modelStr}" with ${augmentedModels.length} models (strategy: ${comboStrategy}, sticky: ${comboStickyLimit})`);
-    return handleComboChat({
-      body,
-      models: augmentedModels,
-      handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
-        adapterAdded
-      ),
-      log,
-      comboName: modelStr,
-      comboStrategy,
-      comboStickyLimit
-    });
+    return runCombo();
   }
 
   // Single model request — may still switch to a capacity-adapter model if the
@@ -157,13 +195,18 @@ export async function handleChat(request, clientRawRequest = null) {
     });
   }
 
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey);
+  // Single model request (client-facing → allow early SSE keepalive)
+  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, { earlySse: true });
 }
 
 /**
- * Handle single model chat request
+ * Handle single model chat request.
+ * @param {{ earlySse?: boolean }} opts - earlySse only for the top-level client-facing
+ *   call. Combo/fusion call this as a sub-handler and need real HTTP status/bodies
+ *   so they can fallback — never nest keepalive SSE there.
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, opts = {}) {
+  const earlySse = opts?.earlySse === true;
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -224,29 +267,69 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
   // Extract userAgent from request
   const userAgent = request?.headers?.get("user-agent") || "";
+  const bypassModelWhitelist = await hasDiagnosticModelTestBypass(request);
 
-  // Try with available accounts (fallback on errors)
+  // Streaming path (top-level only): open SSE immediately + keepalive while waiting
+  // for upstream. Prevents Cloudflare origin_gateway_timeout (~100s first-byte).
+  if (earlySse && clientWantsStream(body)) {
+    return createKeepaliveSseResponse(async ({ writeError }) => {
+      const outcome = await runAccountLoop({
+        provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist,
+      });
+      if (outcome.kind === "response") return outcome.response;
+      // Terminal error after SSE already opened → write as SSE error event
+      writeError(outcome.message, outcome.status);
+      return undefined;
+    });
+  }
+
+  const outcome = await runAccountLoop({
+    provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist,
+  });
+  if (outcome.kind === "response") return outcome.response;
+  if (outcome.kind === "unavailable") {
+    return unavailableResponse(outcome.status, outcome.message, outcome.retryAfter, outcome.retryAfterHuman);
+  }
+  return errorResponse(outcome.status, outcome.message);
+}
+
+/**
+ * Account-selection + handleChatCore loop.
+ * Returns { kind:"response", response } or { kind:"error"|"unavailable", ... }.
+ * Does not throw for provider failures.
+ */
+async function runAccountLoop({ provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist = false }) {
   const excludeConnectionIds = new Set();
   let lastError = null;
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { bypassModelWhitelist });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
         const errorMsg = lastError || credentials.lastError || "Unavailable";
-        const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
+        const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
-        return unavailableResponse(status, `[${provider}/${model}] ${errorMsg}`, credentials.retryAfter, credentials.retryAfterHuman);
+        return {
+          kind: "unavailable",
+          status,
+          message: `[${provider}/${model}] ${errorMsg}`,
+          retryAfter: credentials.retryAfter,
+          retryAfterHuman: credentials.retryAfterHuman,
+        };
       }
       if (excludeConnectionIds.size === 0) {
         log.warn("AUTH", `No active credentials for provider: ${provider}`);
-        return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
+        return { kind: "error", status: HTTP_STATUS.NOT_FOUND, message: `No active credentials for provider: ${provider}` };
       }
       log.warn("CHAT", "No more accounts available", { provider });
-      return errorResponse(lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE, lastError || "All accounts unavailable");
+      return {
+        kind: "error",
+        status: lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE,
+        message: lastError || "All accounts unavailable",
+      };
     }
 
     // Account selection shown in the unified "▶" line (acc:...)
@@ -302,12 +385,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);
-        // "Consecutive" strikes: a success clears the breaker for this pair.
-        clearAntigravityStrikes(credentials.connectionId, model);
       }
     });
 
-    if (result.success) return result.response;
+    if (result.success) return { kind: "response", response: result.response };
 
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
     let quotaResetMs = null;
@@ -334,6 +415,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       continue;
     }
 
-    return result.response;
+    // Non-fallback error: prefer original Response (correct status/body) when present
+    if (result.response) return { kind: "response", response: result.response };
+    return { kind: "error", status: result.status || HTTP_STATUS.BAD_GATEWAY, message: result.error || "Upstream error" };
   }
 }
