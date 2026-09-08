@@ -462,6 +462,39 @@ export function createSSEStream(options = {}) {
           }
         }
 
+        // Empty Claude stream guard: if the upstream produced no translatable
+        // events (stalled/empty turn, or only heartbeat comments), a Claude
+        // client errors with "stream ended before message_start". Synthesize a
+        // minimal complete envelope (message_start → message_delta → message_stop,
+        // content: []) so the client sees a clean empty message instead of a
+        // truncated stream. Mirrors the translator's own empty-turn output.
+        if (sourceFormat === FORMATS.CLAUDE && sseEmittedCount === 0) {
+          const emptyEnvelope = [
+            {
+              type: "message_start",
+              message: {
+                id: `msg_${Date.now()}`,
+                type: "message",
+                role: "assistant",
+                model: state.model || model || "claude",
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 },
+              },
+            },
+            { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } },
+            { type: "message_stop" },
+          ];
+          dbg("SSE", `synthesizing empty claude envelope | provider=${provider} | model=${model}`);
+          for (const item of emptyEnvelope) {
+            const output = formatSSE(item, sourceFormat);
+            reqLogger?.appendConvertedChunk?.(output);
+            controller.enqueue(sharedEncoder.encode(output));
+            sseEmittedCount++;
+          }
+        }
+
         // Synthesize response.failed if a Responses passthrough stream never reached a terminal event
         const keepsOpenAIResponsesFormat = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES;
         if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
