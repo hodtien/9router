@@ -28,6 +28,21 @@ const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try 
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
 
+// Codex /responses rejects any input item whose `name` violates ^[a-zA-Z0-9_-]+$
+// and caps length at 128 chars. Replace offending characters with `_` and
+// truncate so historical function_call / custom_tool_call names from upstream
+// providers (MCP, Claude tool names with dots/colon, unicode, long slugs) pass.
+const CODEX_NAME_INVALID_CHARS = /[^a-zA-Z0-9_-]/g;
+const CODEX_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const CODEX_NAME_MAX_LEN = 128;
+function sanitizeCodexName(raw) {
+  if (typeof raw !== "string") return "";
+  const cleaned = raw.trim().replace(CODEX_NAME_INVALID_CHARS, "_");
+  return cleaned.length > CODEX_NAME_MAX_LEN
+    ? cleaned.slice(0, CODEX_NAME_MAX_LEN)
+    : cleaned;
+}
+
 // Hosted tool types that Codex/OpenAI Responses executes server-side
 const CODEX_HOSTED_TOOL_TYPES = new Set([
   "image_generation", "web_search", "web_search_preview", "file_search",
@@ -411,6 +426,19 @@ export class CodexExecutor extends BaseExecutor {
     // Flatten function tools + drop unsupported types
     normalizeCodexTools(body);
 
+    // Codex /responses requires every input item's `name` to match ^[a-zA-Z0-9_-]+$.
+    // Rewrite only offending names on historical function_call / custom_tool_call items;
+    // tool definitions, tool_choice and call_id stay intact (dispatch is by call_id).
+    if (Array.isArray(body.input)) {
+      for (const item of body.input) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        if (item.type !== "function_call" && item.type !== "custom_tool_call") continue;
+        if (typeof item.name !== "string") continue;
+        const safe = sanitizeCodexName(item.name);
+        if (safe && safe !== item.name) item.name = safe;
+      }
+    }
+
     // Ensure streaming is enabled (Codex API requires it)
     body.stream = true;
 
@@ -452,6 +480,11 @@ export class CodexExecutor extends BaseExecutor {
       if (!body.reasoning.summary) body.reasoning.summary = "auto";
     }
     delete body.reasoning_effort;
+
+    // Codex accepts none/minimal/low/medium/high/xhigh — map 9router's `max` down to xhigh.
+    if (body.reasoning?.effort === "max") {
+      body.reasoning.effort = "xhigh";
+    }
 
     // Include reasoning encrypted content (required by Codex backend for reasoning models)
     if (body.reasoning && body.reasoning.effort && body.reasoning.effort !== 'none') {
