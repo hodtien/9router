@@ -7,15 +7,9 @@ const OPTIONAL_FIELDS = [
   "accessToken", "refreshToken", "expiresAt", "tokenType",
   "scope", "projectId", "apiKey", "testStatus",
   "lastTested", "lastError", "lastErrorAt", "rateLimitedUntil", "expiresIn", "errorCode",
-  "consecutiveUseCount", "allowedModels", "idToken", "lastRefreshAt",
+  "consecutiveUseCount", "idToken", "lastRefreshAt",
 ];
 
-/**
- * Flatten Kiro Account Manager / backup export shape:
- * { credentials: { accessToken, refreshToken, authMethod, region, ... }, idp, machineId }
- * into 9router's flat connection fields. Without this, chat sends no Authorization
- * ("Missing bearer token in the authorization header").
- */
 function flattenNestedCredentials(conn) {
   if (!conn || !conn.credentials || typeof conn.credentials !== "object") return conn;
   if (conn.accessToken || conn.refreshToken || conn.apiKey) return conn;
@@ -84,10 +78,32 @@ function flattenNestedCredentials(conn) {
   };
 }
 
+const MODEL_LOCK_PREFIX = "modelLock_";
+
+function resetHealthStateOnActivation(existing, patch) {
+  if (patch?.testStatus !== "active") return patch;
+
+  const normalized = {
+    ...patch,
+    testStatus: "active",
+    lastError: Object.hasOwn(patch, "lastError") ? patch.lastError : null,
+    lastErrorAt: Object.hasOwn(patch, "lastErrorAt") ? patch.lastErrorAt : null,
+    errorCode: null,
+    rateLimitedUntil: null,
+    backoffLevel: 0,
+  };
+
+  for (const key of Object.keys(existing || {})) {
+    if (key.startsWith(MODEL_LOCK_PREFIX)) normalized[key] = null;
+  }
+
+  return normalized;
+}
+
 function rowToConn(row) {
   if (!row) return null;
   const extra = parseJson(row.data, {});
-  const conn = {
+  return {
     ...extra,
     id: row.id,
     provider: row.provider,
@@ -99,9 +115,6 @@ function rowToConn(row) {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
-  // Only flatten Kiro nested-export shape; leave other providers untouched.
-  if (conn.provider === "kiro") return flattenNestedCredentials(conn);
-  return conn;
 }
 
 function connToRow(c) {
@@ -177,6 +190,7 @@ function reorderInTx(db, providerId) {
 }
 
 export async function createProviderConnection(data) {
+  if (data?.provider === "kiro") data = flattenNestedCredentials(data);
   const db = await getAdapter();
   const now = new Date().toISOString();
   let result;
@@ -224,7 +238,8 @@ export async function createProviderConnection(data) {
     // access_token: never dedup — user manages duplicates manually
 
     if (existing) {
-      const merged = { ...existing, ...data, updatedAt: now };
+      const normalized = resetHealthStateOnActivation(existing, data);
+      const merged = { ...existing, ...normalized, updatedAt: now };
       upsert(db, merged);
       result = merged;
       return;
@@ -273,7 +288,8 @@ export async function updateProviderConnection(id, data) {
     const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
     if (!row) { result = null; return; }
     const existing = rowToConn(row);
-    const merged = { ...existing, ...data, updatedAt: new Date().toISOString() };
+    const normalized = resetHealthStateOnActivation(existing, data);
+    const merged = { ...existing, ...normalized, updatedAt: new Date().toISOString() };
     upsert(db, merged);
     if (data.priority !== undefined) reorderInTx(db, existing.provider);
     result = merged;
@@ -314,7 +330,6 @@ export async function cleanupProviderConnections() {
     "scope", "projectId", "apiKey", "testStatus",
     "lastTested", "lastError", "lastErrorAt", "rateLimitedUntil", "expiresIn",
     "consecutiveUseCount",
-    "allowedModels",
   ];
   let cleaned = 0;
   db.transaction(() => {

@@ -85,3 +85,21 @@ graphify-out/*
 test-results/
 [0-9][0-9][0-9][0-9]-[0-9][0-9]-*.txt
 .next-analyze/*
+<<<<<<< HEAD
+=======
+
+# Kiro local workspace state
+.kiro/
+9router-*
+
+# Local sensitive / temp files
+.engine-token.txt
+.tmp-prov.json
+.tmp-providers.json
+.oauth-session.json
+.dev-server.log
+.dev-server-err.log
+.start-dev.ps1
+start-dev-silent.cjs
+debug.log
+>>>>>>> master
