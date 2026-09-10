@@ -202,8 +202,6 @@ export class CodexExecutor extends BaseExecutor {
   buildHeaders(credentials, stream = true) {
     const headers = super.buildHeaders(credentials, stream);
     headers["session_id"] = this._currentSessionId || credentials?.connectionId || "default";
-    // Identify client type to Codex backend (matches official codex CLI)
-    if (!headers["originator"]) headers["originator"] = "codex_cli_rs";
     // Account/workspace binding header — required when multiple Codex accounts
     // are configured. OAuth import stores ChatGPT account ID as chatgptAccountId;
     // older/custom rows may use workspaceId/accountId. Prefer explicit workspaceId
@@ -213,6 +211,15 @@ export class CodexExecutor extends BaseExecutor {
       credentials?.providerSpecificData?.workspaceId ||
       credentials?.providerSpecificData?.chatgptAccountId ||
       credentials?.providerSpecificData?.accountId;
+    // Identify client type to Codex backend. Rotate the suffix per account so
+    // 50 connections on one machine don't fingerprint-collapse to a single
+    // Codex CLI instance (OpenAI fingerprint behavior). The transport registry
+    // pre-populates `originator: "codex_cli_rs"` via super.buildHeaders, so we
+    // always overwrite — the fallback keeps the bare value when no account id
+    // is available.
+    headers["originator"] = accountId
+      ? `codex_cli_rs/${String(accountId).slice(0, 8)}`
+      : "codex_cli_rs";
     if (typeof accountId === "string" && accountId && !headers["ChatGPT-Account-ID"]) {
       headers["ChatGPT-Account-ID"] = accountId;
     }
