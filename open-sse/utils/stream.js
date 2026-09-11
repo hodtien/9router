@@ -77,6 +77,7 @@ export function createSSEStream(options = {}) {
   let openAIResponsesDoneSent = false;
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
+  let claudeMessageStopSeen = false;  // track Claude terminal event for partial-stream synthesis
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
   // closes right after the terminal event cancels the reader, and flush() never runs.
@@ -369,6 +370,9 @@ export function createSSEStream(options = {}) {
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
             sseEmittedCount++;
+            if (sourceFormat === FORMATS.CLAUDE && item.type === "message_stop") {
+              claudeMessageStopSeen = true;
+            }
           }
         }
       }
@@ -462,6 +466,63 @@ export function createSSEStream(options = {}) {
           }
         }
 
+<<<<<<< Updated upstream
+=======
+        // Empty Claude stream guard: if the upstream produced no translatable
+        // events (stalled/empty turn, or only heartbeat comments), a Claude
+        // client errors with "stream ended before message_start". Synthesize a
+        // minimal complete envelope (message_start → message_delta → message_stop,
+        // content: []) so the client sees a clean empty message instead of a
+        // truncated stream. Mirrors the translator's own empty-turn output.
+        if (sourceFormat === FORMATS.CLAUDE && sseEmittedCount === 0) {
+          const emptyEnvelope = [
+            {
+              type: "message_start",
+              message: {
+                id: `msg_${Date.now()}`,
+                type: "message",
+                role: "assistant",
+                model: state.model || model || "claude",
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 },
+              },
+            },
+            { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } },
+            { type: "message_stop" },
+          ];
+          dbg("SSE", `synthesizing empty claude envelope | provider=${provider} | model=${model}`);
+          for (const item of emptyEnvelope) {
+            const output = formatSSE(item, sourceFormat);
+            reqLogger?.appendConvertedChunk?.(output);
+            controller.enqueue(sharedEncoder.encode(output));
+            sseEmittedCount++;
+            if (sourceFormat === FORMATS.CLAUDE && item.type === "message_stop") {
+              claudeMessageStopSeen = true;
+            }
+          }
+        } else if (sourceFormat === FORMATS.CLAUDE && !claudeMessageStopSeen) {
+          // Partial Claude stream: upstream emitted message_start/content blocks
+          // but never reached message_stop (typically a client-side abort or
+          // upstream cancel). Synthesize a message_delta + message_stop so the
+          // client does not error with "stream ended before message_stop".
+          // Stop reason is left null — clients treat any terminal as success.
+          const tailEnvelope = [
+            { type: "message_delta", delta: {}, usage: { output_tokens: 0 } },
+            { type: "message_stop" },
+          ];
+          dbg("SSE", `synthesizing partial claude tail | provider=${provider} | model=${model} | emitted=${sseEmittedCount}`);
+          for (const item of tailEnvelope) {
+            const output = formatSSE(item, sourceFormat);
+            reqLogger?.appendConvertedChunk?.(output);
+            controller.enqueue(sharedEncoder.encode(output));
+            sseEmittedCount++;
+            if (item.type === "message_stop") claudeMessageStopSeen = true;
+          }
+        }
+
+>>>>>>> Stashed changes
         // Synthesize response.failed if a Responses passthrough stream never reached a terminal event
         const keepsOpenAIResponsesFormat = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES;
         if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
