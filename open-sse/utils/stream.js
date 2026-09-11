@@ -77,6 +77,7 @@ export function createSSEStream(options = {}) {
   let openAIResponsesDoneSent = false;
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
+  let claudeMessageStopSeen = false;  // track Claude terminal event for partial-stream synthesis
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
   // closes right after the terminal event cancels the reader, and flush() never runs.
@@ -369,6 +370,9 @@ export function createSSEStream(options = {}) {
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
             sseEmittedCount++;
+            if (sourceFormat === FORMATS.CLAUDE && item.type === "message_stop") {
+              claudeMessageStopSeen = true;
+            }
           }
         }
       }
@@ -462,6 +466,11 @@ export function createSSEStream(options = {}) {
           }
         }
 
+<<<<<<< HEAD
+=======
+<<<<<<< Updated upstream
+=======
+>>>>>>> fix/stream-partial-terminal-synthesis
         // Empty Claude stream guard: if the upstream produced no translatable
         // events (stalled/empty turn, or only heartbeat comments), a Claude
         // client errors with "stream ended before message_start". Synthesize a
@@ -492,9 +501,37 @@ export function createSSEStream(options = {}) {
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
             sseEmittedCount++;
+<<<<<<< HEAD
           }
         }
 
+=======
+            if (sourceFormat === FORMATS.CLAUDE && item.type === "message_stop") {
+              claudeMessageStopSeen = true;
+            }
+          }
+        } else if (sourceFormat === FORMATS.CLAUDE && !claudeMessageStopSeen) {
+          // Partial Claude stream: upstream emitted message_start/content blocks
+          // but never reached message_stop (typically a client-side abort or
+          // upstream cancel). Synthesize a message_delta + message_stop so the
+          // client does not error with "stream ended before message_stop".
+          // Stop reason is left null — clients treat any terminal as success.
+          const tailEnvelope = [
+            { type: "message_delta", delta: {}, usage: { output_tokens: 0 } },
+            { type: "message_stop" },
+          ];
+          dbg("SSE", `synthesizing partial claude tail | provider=${provider} | model=${model} | emitted=${sseEmittedCount}`);
+          for (const item of tailEnvelope) {
+            const output = formatSSE(item, sourceFormat);
+            reqLogger?.appendConvertedChunk?.(output);
+            controller.enqueue(sharedEncoder.encode(output));
+            sseEmittedCount++;
+            if (item.type === "message_stop") claudeMessageStopSeen = true;
+          }
+        }
+
+>>>>>>> Stashed changes
+>>>>>>> fix/stream-partial-terminal-synthesis
         // Synthesize response.failed if a Responses passthrough stream never reached a terminal event
         const keepsOpenAIResponsesFormat = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES;
         if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
