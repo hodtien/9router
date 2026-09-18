@@ -114,43 +114,54 @@ describe("OpenCode Free prepareRequestCredentials (request-local session)", () =
 });
 
 describe("OpenCode Free User-Agent Validation", () => {
-  it("defaults User-Agent to opencode/1.18.31 ... for non-opencode downstream clients", () => {
+  it("rotates the User-Agent across the pool for non-opencode downstream clients", () => {
     const executor = new OpenCodeExecutor();
-    expect(executor.buildHeaders({}).UserAgent ?? executor.buildHeaders({})["User-Agent"]).toBe(
-      "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
-    );
-    const headersClaude = executor.buildHeaders({ rawHeaders: { "user-agent": "Claude-Code/1.0" } });
-    expect(headersClaude["User-Agent"]).toBe(
-      "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
-    );
+    const uas = new Set();
+    for (let i = 0; i < 6; i++) {
+      const headers = executor.buildHeaders({});
+      uas.add(headers["User-Agent"]);
+    }
+    // ponytail: rotation should hit at least 3 of the 5 pool entries across
+    // 6 consecutive calls. If it stays at 1, rotation is broken.
+    expect(uas.size).toBeGreaterThanOrEqual(3);
+    for (const ua of uas) {
+      expect(ua).toMatch(/^opencode\/1\.(1[7-9]|18)\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/bun\/\d+\.\d+\.\d+$/);
+    }
   });
 
-  it("replaces bare 'opencode' UA with versioned default", () => {
+  it("rotates x-opencode-client across the pool for non-opencode downstream clients", () => {
     const executor = new OpenCodeExecutor();
-    const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode" } });
-    expect(headers["User-Agent"]).toBe(
-      "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
-    );
+    const clients = new Set();
+    for (let i = 0; i < 8; i++) {
+      const headers = executor.buildHeaders({});
+      clients.add(headers["x-opencode-client"]);
+    }
+    expect(clients.size).toBeGreaterThanOrEqual(2);
+    for (const c of clients) {
+      expect(["desktop", "cli", "desktop-app", "cli-app"]).toContain(c);
+    }
   });
 
-  it("upgrades outdated opencode versions (< 1.17)", () => {
+  it("preserves a downstream opencode UA verbatim and does not rotate it", () => {
+    const executor = new OpenCodeExecutor();
+    const headers = executor.buildHeaders({
+      rawHeaders: { "user-agent": "opencode/1.19.0" },
+    });
+    expect(headers["User-Agent"]).toBe("opencode/1.19.0");
+  });
+
+  it("preserves a downstream x-opencode-client verbatim and does not rotate it", () => {
+    const executor = new OpenCodeExecutor();
+    const headers = executor.buildHeaders({
+      rawHeaders: { "x-opencode-client": "tui" },
+    });
+    expect(headers["x-opencode-client"]).toBe("tui");
+  });
+
+  it("upgrades outdated opencode versions (< 1.17) but still rotates", () => {
     const executor = new OpenCodeExecutor();
     const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.15.0" } });
-    expect(headers["User-Agent"]).toBe(
-      "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
-    );
-  });
-
-  it("preserves valid opencode versions (>= 1.17)", () => {
-    const executor = new OpenCodeExecutor();
-    const headers118 = executor.buildHeaders({
-      rawHeaders: { "user-agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14" },
-    });
-    expect(headers118["User-Agent"]).toBe(
-      "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
-    );
-    const headersFuture = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.19.0" } });
-    expect(headersFuture["User-Agent"]).toBe("opencode/1.19.0");
+    expect(headers["User-Agent"]).toMatch(/^opencode\/1\.18\./);
   });
 });
 

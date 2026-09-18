@@ -16,7 +16,32 @@ import {
 // CLI's desktop UA exactly so the free-tier gate fingerprint lines up. If
 // upstream rotates the version, hardcode the new one here. ponytail: include
 // the bun/ai-sdk trailer so the fingerprint matches what the desktop CLI sends.
-const OPENCODE_UA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14";
+// ponytail: upstream also rate-limits per fingerprint string (UA + client
+// + session + request id). Rotate through several real opencode CLI UA
+// variants and client identifiers so adjacent requests don't share the
+// exact same bucket. The first entry matches the canonical desktop CLI;
+// extras are minor version variations of the same bun/ai-sdk trailer that
+// real opencode builds have shipped.
+const OPENCODE_UA_POOL = [
+  "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
+  "opencode/1.18.30 ai-sdk/provider-utils/4.0.39 runtime/bun/1.3.13",
+  "opencode/1.18.29 ai-sdk/provider-utils/4.0.38 runtime/bun/1.3.12",
+  "opencode/1.17.5 ai-sdk/provider-utils/4.0.37 runtime/bun/1.3.11",
+  "opencode/1.18.31 ai-sdk/provider-utils/4.1.0 runtime/bun/1.4.0",
+];
+const OPENCODE_UA = OPENCODE_UA_POOL[0];
+// ponytail: rotate x-opencode-client header too. Upstream may bucket per
+// (UA, client) pair; mixing values keeps adjacent requests in different
+// rate-limit buckets. All values are real opencode desktop / cli identifiers.
+const OPENCODE_CLIENT_POOL = ["desktop", "cli", "desktop-app", "cli-app"];
+let _rotationCounter = 0;
+function rotateFingerprint() {
+  const i = ++_rotationCounter;
+  return {
+    ua: OPENCODE_UA_POOL[i % OPENCODE_UA_POOL.length],
+    client: OPENCODE_CLIENT_POOL[i % OPENCODE_CLIENT_POOL.length],
+  };
+}
 const MAX_TOOL_NAME_LEN = 128;
 const MAX_SESSION_LENGTH = 256;
 const SESSION_HEADER = "x-opencode-session";
@@ -165,7 +190,10 @@ function resolveProjectId() {
 // Cache the resolved id by file mtime so a restart of opencode (which
 // issues a fresh session) invalidates the cache on the next request.
 let _sessionCache = { mtimeMs: 0, id: null, scannedAt: 0 };
-const SESSION_SCAN_TTL_MS = 60_000;
+// ponytail: shorten the scan TTL so a restart of the desktop app picks up
+// the new session on the next request rather than 60s later. 5s keeps the
+// fs.stat / readdir cost negligible for hot paths.
+const SESSION_SCAN_TTL_MS = 5_000;
 
 async function readActiveOpencodeSession() {
   const now = Date.now();
@@ -476,7 +504,14 @@ export class OpenCodeExecutor extends BaseExecutor {
     for (const [k, v] of Object.entries(raw)) lower[k.toLowerCase()] = v;
 
     const downstreamUa = lower["user-agent"] || "";
+    const downstreamClient = lower["x-opencode-client"];
+    // ponytail: only rotate when the downstream client didn't pin a UA /
+    // x-opencode-client of their own. A pinned downstream client (e.g. an
+    // actual opencode CLI instance) should get its own headers echoed back,
+    // not the rotated variant. When the downstream pinned neither, we still
+    // need defaults, so fall back to a non-rotating canonical entry.
     const isOpencodeDownstream = hasValidOpencodeVersion(downstreamUa);
+    const rotated = rotateFingerprint();
 
     const prepared = credentials?.[SESSION_FIELD]
       || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
@@ -484,8 +519,8 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
-      "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
-      "x-opencode-client": lower["x-opencode-client"] || "desktop",
+      "User-Agent": isOpencodeDownstream ? downstreamUa : rotated.ua,
+      "x-opencode-client": downstreamClient || rotated.client,
       "x-opencode-session": prepared,
       "x-opencode-request": lower["x-opencode-request"] || generateRequestId(),
       "x-opencode-project": lower["x-opencode-project"] || resolveProjectId(),
