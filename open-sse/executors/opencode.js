@@ -547,6 +547,10 @@ export class OpenCodeExecutor extends BaseExecutor {
       headers,
       body: JSON.stringify(transformedBody),
       stream: !!stream,
+      // ponytail: opencode rate-limits per source IP. Pass the connection
+      // proxy from the virtual noauth credentials so Bun's fetch() tunnels
+      // out via that pool, refreshing the upstream rate-limit bucket.
+      proxyUrl: credentials?.connectionProxyUrl || "",
     });
 
     const child = (await import("node:child_process")).spawn(bunBin, ["--cwd=/tmp", scriptPath], {
