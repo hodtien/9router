@@ -466,11 +466,6 @@ export function createSSEStream(options = {}) {
           }
         }
 
-<<<<<<< HEAD
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> fix/stream-partial-terminal-synthesis
         // Empty Claude stream guard: if the upstream produced no translatable
         // events (stalled/empty turn, or only heartbeat comments), a Claude
         // client errors with "stream ended before message_start". Synthesize a
@@ -501,11 +496,6 @@ export function createSSEStream(options = {}) {
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
             sseEmittedCount++;
-<<<<<<< HEAD
-          }
-        }
-
-=======
             if (sourceFormat === FORMATS.CLAUDE && item.type === "message_stop") {
               claudeMessageStopSeen = true;
             }
@@ -530,8 +520,6 @@ export function createSSEStream(options = {}) {
           }
         }
 
->>>>>>> Stashed changes
->>>>>>> fix/stream-partial-terminal-synthesis
         // Synthesize response.failed if a Responses passthrough stream never reached a terminal event
         const keepsOpenAIResponsesFormat = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES;
         if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
