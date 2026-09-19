@@ -11,6 +11,11 @@ import {
   coerceResponsesArguments,
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
+import {
+  resolveOpencodeToolFingerprint,
+  noteOpencodeFingerprintSuccess,
+  noteOpencodeFingerprintRefusal,
+} from "./opencodeToolFingerprint.js";
 
 // ponytail: opencode gate checks the UA prefix+version. Match the opencode
 // CLI's desktop UA exactly so the free-tier gate fingerprint lines up. If
@@ -308,12 +313,17 @@ function toolNameOf(tool) {
   return raw.trim();
 }
 
-// ponytail: merge the upstream-mandated file-search quartet into Chat Completions
-// bodies. Caller tools are preserved verbatim (extras are allowed upstream);
-// only the missing fingerprint names are appended as no-op declarations the
-// model may ignore. Without this, plain chat callers that send no tools get
-// 403 FreeTierError on every request.
-function ensureChatFingerprintTools(body) {
+// ponytail: merge the upstream-mandated file-search tool names into Chat
+// Completions bodies. Caller tools are preserved verbatim (extras are allowed
+// upstream); only the missing fingerprint names are appended as no-op
+// declarations the model may ignore. Without this, plain chat callers that
+// send no tools get 403 FreeTierError on every request.
+//
+// PR #14013: the fingerprint list is per-model and drifts, so resolve the
+// current accepted set from opencodeToolFingerprint.js. A successful response
+// promotes the observed tools into the model cache; three consecutive 403
+// refusals drop the learned list back to the default (see chatCore hooks).
+function ensureChatFingerprintTools(body, model) {
   if (!body || typeof body !== "object") return;
   const present = new Set();
   if (Array.isArray(body.tools)) {
@@ -324,7 +334,8 @@ function ensureChatFingerprintTools(body) {
   } else {
     body.tools = [];
   }
-  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
+  const fingerprint = resolveOpencodeToolFingerprint(model);
+  for (const name of fingerprint) {
     if (present.has(name)) continue;
     body.tools.push({
       type: "function",
@@ -341,7 +352,7 @@ function ensureChatFingerprintTools(body) {
 // ponytail: same fingerprint for the Responses flat tool shape. Runs before
 // normalizeResponsesTools so injected declarations get the same coercion as
 // caller tools.
-function ensureResponsesFingerprintTools(body) {
+function ensureResponsesFingerprintTools(body, model) {
   if (!body || typeof body !== "object") return;
   const present = new Set();
   if (Array.isArray(body.tools)) {
@@ -352,7 +363,8 @@ function ensureResponsesFingerprintTools(body) {
   } else {
     body.tools = [];
   }
-  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
+  const fingerprint = resolveOpencodeToolFingerprint(model);
+  for (const name of fingerprint) {
     if (present.has(name)) continue;
     body.tools.push({
       type: "function",
@@ -465,7 +477,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       delete body.max_completion_tokens;
       normalizeOpencodeReasoning(model, body);
       body.store = false;
-      ensureResponsesFingerprintTools(body);
+      ensureResponsesFingerprintTools(body, model);
       normalizeResponsesTools(body);
       sanitizeResponsesItems(body);
       return injectReasoningContent({ provider: this.provider, model, body });
@@ -482,11 +494,11 @@ export class OpenCodeExecutor extends BaseExecutor {
         body.max_tokens = 100000;
       }
       normalizeOpencodeReasoning(model, body);
-      ensureChatFingerprintTools(body);
+      ensureChatFingerprintTools(body, model);
       return injectReasoningContent({ provider: this.provider, model, body });
     }
     if (body && typeof body === "object") {
-      ensureChatFingerprintTools(body);
+      ensureChatFingerprintTools(body, model);
     }
     return injectReasoningContent({ provider: this.provider, model, body });
   }
