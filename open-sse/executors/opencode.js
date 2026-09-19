@@ -617,44 +617,56 @@ export class OpenCodeExecutor extends BaseExecutor {
     child.stdin.end(input);
 
     if (stream) {
-      // ponytail: route the Bun subprocess stdout into a ReadableStream body
-      // the gateway can actually consume. The previous version wrote straight
-      // to process.stdout, which bypassed the gateway's SSE transform pipeline
-      // — so `response.completed` events never reached `extractUsage()` and
-      // every streaming request logged IN 0 / OUT 0 even when upstream
-      // emitted usage. Now the bytes flow through a ReadableStream and the
-      // chain picks up `input_tokens` / `output_tokens` as designed.
-      let headerBuf = Buffer.alloc(0);
-      let headerParsed = null;
-      const body = new ReadableStream({
-        start(controller) {
-          child.stdout.on("data", (chunk) => {
-            if (headerParsed) {
-              controller.enqueue(chunk);
-              return;
-            }
-            headerBuf = Buffer.concat([headerBuf, chunk]);
-            const nl = headerBuf.indexOf(0x0a);
-            if (nl < 0) return;
-            try {
-              headerParsed = JSON.parse(headerBuf.slice(0, nl).toString("utf8"));
-              const tail = headerBuf.slice(nl + 1);
+      // Wait for the metadata line before constructing Response. Returning
+      // early would default every upstream error to HTTP 200 and turn its body
+      // into an apparently successful empty SSE stream.
+      return new Promise((resolve, reject) => {
+        let headerBuf = Buffer.alloc(0);
+        let controller = null;
+        let stderr = "";
+
+        child.stdout.on("data", (chunk) => {
+          if (controller) {
+            controller.enqueue(chunk);
+            return;
+          }
+          headerBuf = Buffer.concat([headerBuf, chunk]);
+          const nl = headerBuf.indexOf(0x0a);
+          if (nl < 0) return;
+
+          let metadata;
+          try {
+            metadata = JSON.parse(headerBuf.slice(0, nl).toString("utf8"));
+          } catch (error) {
+            reject(new Error(`opencode Bun fetcher: bad metadata: ${error.message}`));
+            return;
+          }
+          const tail = headerBuf.slice(nl + 1);
+          const responseBody = new ReadableStream({
+            start(streamController) {
+              controller = streamController;
               if (tail.length) controller.enqueue(tail);
-            } catch {
-              return;
-            }
+            },
           });
-          child.stderr.on("data", (chunk) => controller.enqueue(chunk));
-          child.on("error", (err) => controller.error(err));
-          child.on("exit", (code) => {
-            if (code !== 0) controller.error(new Error(`opencode Bun fetcher exit=${code}`));
-            else controller.close();
+          resolve({
+            response: new Response(responseBody, { status: metadata.status, headers: metadata.headers || {} }),
+            url, headers, transformedBody,
           });
-        },
-      });
-      return Promise.resolve({
-        response: new Response(body, { status: headerParsed?.status || 200, headers: headerParsed?.headers || {} }),
-        url, headers, transformedBody,
+        });
+        child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+        child.on("error", (error) => {
+          if (controller) controller.error(error);
+          else reject(error);
+        });
+        child.on("exit", (code) => {
+          if (!controller) {
+            reject(new Error(`opencode Bun fetcher exited before metadata (exit=${code}) stderr=${stderr.slice(0, 500)}`));
+          } else if (code !== 0) {
+            controller.error(new Error(`opencode Bun fetcher exit=${code} stderr=${stderr.slice(0, 500)}`));
+          } else {
+            controller.close();
+          }
+        });
       });
     }
 
