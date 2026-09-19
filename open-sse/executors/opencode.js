@@ -12,54 +12,21 @@ import {
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
 import {
-  resolveOpencodeToolFingerprint,
-  noteOpencodeFingerprintSuccess,
-  noteOpencodeFingerprintRefusal,
-} from "./opencodeToolFingerprint.js";
+  isGatedFreeTierRequest,
+  noteFreeTierOutcome,
+  prepareFreeTierRequest,
+  rebuildJsonFromForcedStream,
+} from "./opencodeFreeTierContract.js";
 
-// ponytail: opencode gate checks the UA prefix+version. Match the opencode
-// CLI's desktop UA exactly so the free-tier gate fingerprint lines up. If
-// upstream rotates the version, hardcode the new one here. ponytail: include
-// the bun/ai-sdk trailer so the fingerprint matches what the desktop CLI sends.
-// ponytail: upstream also rate-limits per fingerprint string (UA + client
-// + session + request id). Rotate through several real opencode CLI UA
-// variants and client identifiers so adjacent requests don't share the
-// exact same bucket. The first entry matches the canonical desktop CLI;
-// extras are minor version variations of the same bun/ai-sdk trailer that
-// real opencode builds have shipped.
-const OPENCODE_UA_POOL = [
-  "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14",
-  "opencode/1.18.30 ai-sdk/provider-utils/4.0.39 runtime/bun/1.3.13",
-  "opencode/1.18.29 ai-sdk/provider-utils/4.0.38 runtime/bun/1.3.12",
-  "opencode/1.17.5 ai-sdk/provider-utils/4.0.37 runtime/bun/1.3.11",
-  "opencode/1.18.31 ai-sdk/provider-utils/4.1.0 runtime/bun/1.4.0",
-];
-const OPENCODE_UA = OPENCODE_UA_POOL[0];
-// ponytail: rotate x-opencode-client header too. Upstream may bucket per
-// (UA, client) pair; mixing values keeps adjacent requests in different
-// rate-limit buckets. All values are real opencode desktop / cli identifiers.
-const OPENCODE_CLIENT_POOL = ["desktop", "cli", "desktop-app", "cli-app"];
-let _rotationCounter = 0;
-function rotateFingerprint() {
-  const i = ++_rotationCounter;
-  return {
-    ua: OPENCODE_UA_POOL[i % OPENCODE_UA_POOL.length],
-    client: OPENCODE_CLIENT_POOL[i % OPENCODE_CLIENT_POOL.length],
-  };
-}
+const OPENCODE_UA = "opencode/1.18.31";
 const MAX_TOOL_NAME_LEN = 128;
 const MAX_SESSION_LENGTH = 256;
 const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
+const CONTRACT_SESSION_FIELD = "_opencodeContractSession";
+const CONTRACT_ATTEMPT_FIELD = "_opencodeContractAttempt";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-// ponytail: upstream free-tier gate (verified live 2026-09-18 via decolua/9router
-// PR #4132) fingerprints the official agentic client on four axes: UA version,
-// canonical session shape, the file-search tool quartet {bash, glob, grep, read},
-// and streaming. Plain chat callers send no tools, so without injection every
-// such request 403s. Extras upstream are allowed (we only append missing names).
-const OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"];
-
 function hasValidOpencodeVersion(ua) {
   const m = String(ua || "").match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
   if (!m) return false;
@@ -148,95 +115,23 @@ function normalizeSession(value) {
   return normalized;
 }
 
-function nativeSession(headers) {
+function clientSuppliedSession(headers) {
   if (!headers || typeof headers !== "object") return null;
+  let fallback = null;
   for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === SESSION_HEADER) {
-      const normalized = normalizeSession(value);
-      if (normalized && OPENCODE_SESSION_RE.test(normalized)) return normalized;
-    }
+    const normalizedKey = key.toLowerCase();
+    if (normalizedKey !== SESSION_HEADER && normalizedKey !== "x-session-id") continue;
+    const normalized = normalizeSession(value);
+    if (!normalized) continue;
+    if (normalizedKey === SESSION_HEADER) return normalized;
+    fallback = normalized;
   }
-  return null;
+  return fallback;
 }
 
-// ponytail: opencode upstream binds the request to a project hash derived
-// from the workspace cwd. The desktop CLI passes a sha1 of the directory
-// path; the bun/ai-sdk client (used by groxy from outside a project) sends
-// "global" when no workspace is loaded. Use OPENCODE_PROJECT_ID env to
-// pin a specific project, otherwise fall back to "global" so the upstream
-// match the no-workspace case. ponytail: track upstream's project hash
-// scheme by mirroring the desktop CLI's sha1(path) → hex if env is unset
-// and cwd is meaningful.
-function resolveProjectId() {
-  const envId = process.env.OPENCODE_PROJECT_ID?.trim();
-  if (envId) return envId;
-  return "global";
-}
-
-// ponytail: opencode's free-tier gate rejects fresh session IDs because the
-// server only honors sessions that exist in its active-session table. Those
-// entries are issued when a client authenticates with the upstream OAuth
-// (or, for the public-bearer fallback, when the opencode desktop app posts
-// a session over its long-lived WebSocket).
-//
-// Resolution order (first hit wins):
-//   1. OPENCODE_SESSION_ID env — set this on headless boxes (VPS, CI) after
-//      running `opencode run` once and grepping the resulting session id
-//      out of the local opencode SQLite db (the desktop app's window data
-//      file is not present).
-//   2. Active session id parsed from the opencode desktop's window data
-//      files (`opencode.window.*.dat`) — works on dev boxes that also run
-//      the desktop app.
-//   3. Fresh `ses_<descending>` — kept for the cache-miss case so we still
-//      produce a syntactically valid header even when no upstream session
-//      is available; the request will 403, but the executor surfaces the
-//      error rather than failing on a malformed header.
-//
-// Cache the resolved id by file mtime so a restart of opencode (which
-// issues a fresh session) invalidates the cache on the next request.
-let _sessionCache = { mtimeMs: 0, id: null, scannedAt: 0 };
-// ponytail: shorten the scan TTL so a restart of the desktop app picks up
-// the new session on the next request rather than 60s later. 5s keeps the
-// fs.stat / readdir cost negligible for hot paths.
-const SESSION_SCAN_TTL_MS = 5_000;
-
-async function readActiveOpencodeSession() {
-  const now = Date.now();
-  if (_sessionCache.id && (now - _sessionCache.scannedAt) < SESSION_SCAN_TTL_MS) {
-    return _sessionCache.id;
-  }
-  // Highest priority: pinned env var. Cache hit so repeated reads stay free.
-  const envId = process.env.OPENCODE_SESSION_ID?.trim();
-  if (envId) {
-    _sessionCache = { mtimeMs: 0, id: envId, scannedAt: now };
-    return envId;
-  }
-  const fs = await import("node:fs/promises");
-  const path = await import("node:path");
-  const home = process.env.HOME || process.env.USERPROFILE;
-  if (!home) return null;
-  const dir = path.join(home, "Library", "Application Support", "ai.opencode.desktop");
-  let files;
-  try { files = await fs.readdir(dir); } catch { return null; }
-  let best = null;
-  for (const name of files) {
-    if (!name.startsWith("opencode.window.") || !name.endsWith(".dat")) continue;
-    const fullPath = path.join(dir, name);
-    try {
-      const stat = await fs.stat(fullPath);
-      if (!best || stat.mtimeMs > best.mtimeMs) best = { fullPath, mtimeMs: stat.mtimeMs };
-    } catch {}
-  }
-  if (!best) return null;
-  if (best.mtimeMs === _sessionCache.mtimeMs && _sessionCache.id) return _sessionCache.id;
-  let raw;
-  try { raw = await fs.readFile(best.fullPath, "utf8"); } catch { return null; }
-  const matches = raw.match(/ses_[A-Za-z0-9]+/g) || [];
-  // Pick the most recently referenced session id — the order in the JSON
-  // mirrors the tab order, with the active tab last.
-  const id = matches.length ? matches[matches.length - 1] : null;
-  _sessionCache = { mtimeMs: best.mtimeMs, id, scannedAt: now };
-  return id;
+function nativeSession(headers) {
+  const session = clientSuppliedSession(headers);
+  return session && OPENCODE_SESSION_RE.test(session) ? session : null;
 }
 
 // Strip the thinking suffix "model(level)" so registry lookups hit the base id.
@@ -251,6 +146,12 @@ function isResponsesModel(model) {
 
 function isAnthropicMessagesModel(model) {
   return ANTHROPIC_MESSAGES_MODELS.has(baseModelId(model));
+}
+
+function requestFormatForModel(model) {
+  if (isResponsesModel(model)) return "openai-responses";
+  if (isAnthropicMessagesModel(model)) return "anthropic-messages";
+  return "openai";
 }
 
 function resolveOpencodeSession(body, credentials, providerSessionId, clientTool) {
@@ -274,106 +175,6 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   });
 
   return resolved ? translateSessionId(resolved, clientTool) : generateSessionId();
-}
-
-function normalizeResponsesTools(body) {
-  if (!Array.isArray(body.tools)) return;
-  const validNames = new Set();
-  body.tools = body.tools.filter((tool) => {
-    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false;
-    const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
-    const rawName = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
-    const name = rawName.trim();
-    if (!name) return false;
-    const description = typeof tool.description === "string" ? tool.description : (typeof fn?.description === "string" ? fn.description : "");
-    let parameters = (tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters))
-      ? tool.parameters
-      : (fn?.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters) ? fn.parameters : { type: "object", properties: {} });
-    if (parameters.type === "object" && !parameters.properties) parameters = { ...parameters, properties: {} };
-    for (const k of Object.keys(tool)) delete tool[k];
-    tool.type = "function";
-    tool.name = name.slice(0, MAX_TOOL_NAME_LEN);
-    if (description) tool.description = description;
-    tool.parameters = parameters;
-    validNames.add(tool.name);
-    return true;
-  });
-  if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)) {
-    if (body.tool_choice.type === "function") {
-      const n = typeof body.tool_choice.name === "string" ? body.tool_choice.name.trim() : "";
-      if (!n || !validNames.has(n)) delete body.tool_choice;
-    }
-  }
-}
-
-function toolNameOf(tool) {
-  if (!tool || typeof tool !== "object" || Array.isArray(tool)) return "";
-  const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
-  const raw = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
-  return raw.trim();
-}
-
-// ponytail: merge the upstream-mandated file-search tool names into Chat
-// Completions bodies. Caller tools are preserved verbatim (extras are allowed
-// upstream); only the missing fingerprint names are appended as no-op
-// declarations the model may ignore. Without this, plain chat callers that
-// send no tools get 403 FreeTierError on every request.
-//
-// PR #14013: the fingerprint list is per-model and drifts, so resolve the
-// current accepted set from opencodeToolFingerprint.js. A successful response
-// promotes the observed tools into the model cache; three consecutive 403
-// refusals drop the learned list back to the default (see chatCore hooks).
-function ensureChatFingerprintTools(body, model) {
-  if (!body || typeof body !== "object") return;
-  const present = new Set();
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      const name = toolNameOf(tool);
-      if (name) present.add(name);
-    }
-  } else {
-    body.tools = [];
-  }
-  const fingerprint = resolveOpencodeToolFingerprint(model);
-  for (const name of fingerprint) {
-    if (present.has(name)) continue;
-    body.tools.push({
-      type: "function",
-      function: {
-        name,
-        description: `OpenCode built-in ${name} tool`,
-        parameters: { type: "object", properties: {} },
-      },
-    });
-    present.add(name);
-  }
-}
-
-// ponytail: same fingerprint for the Responses flat tool shape. Runs before
-// normalizeResponsesTools so injected declarations get the same coercion as
-// caller tools.
-function ensureResponsesFingerprintTools(body, model) {
-  if (!body || typeof body !== "object") return;
-  const present = new Set();
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      const name = toolNameOf(tool);
-      if (name) present.add(name);
-    }
-  } else {
-    body.tools = [];
-  }
-  const fingerprint = resolveOpencodeToolFingerprint(model);
-  for (const name of fingerprint) {
-    if (present.has(name)) continue;
-    body.tools.push({
-      type: "function",
-      name,
-      description: `OpenCode built-in ${name} tool`,
-      parameters: { type: "object", properties: {} },
-    });
-    present.add(name);
-  }
 }
 
 function sanitizeResponsesItems(body) {
@@ -445,26 +246,20 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       ...sourceCredentials,
       [SESSION_FIELD]: resolved,
+      [CONTRACT_SESSION_FIELD]: clientSuppliedSession(sourceCredentials.rawHeaders) || undefined,
     };
   }
 
   transformRequest(model, body, stream, credentials) {
     if (body && typeof body === "object" && model && !body.model) body.model = model;
-    if (body && typeof body === "object") {
-      // ponytail: upstream rejects non-streaming free-tier requests with 403
-      // even when everything else is valid. chatCore converts back to JSON
-      // for non-stream clients via the existing forced-SSE path, so always
-      // send stream:true upstream here.
-      body.stream = true;
-    }
+    let requestFormat = "openai";
     if (isResponsesModel(model || body?.model) && body && typeof body === "object") {
+      requestFormat = "openai-responses";
       const normalized = normalizeResponsesInput(body.input);
       if (normalized) body.input = normalized;
       if (!Array.isArray(body.input) || body.input.length === 0) {
         body.input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "..." }] }];
       }
-      // Responses API names the output cap max_output_tokens and takes thinking
-      // as reasoning:{effort,summary} — normalize the Chat fields at this boundary.
       const clientCap = body.max_output_tokens
         ?? body.max_completion_tokens
         ?? body.max_tokens;
@@ -477,30 +272,29 @@ export class OpenCodeExecutor extends BaseExecutor {
       delete body.max_completion_tokens;
       normalizeOpencodeReasoning(model, body);
       body.store = false;
-      ensureResponsesFingerprintTools(body, model);
-      normalizeResponsesTools(body);
       sanitizeResponsesItems(body);
-      return injectReasoningContent({ provider: this.provider, model, body });
-    }
-    // ponytail: Anthropic Messages uses max_tokens and a separate
-    // reasoning:{effort} envelope (no max_output_tokens). The translator
-    // already emits Anthropic-shape bodies when targetFormat=anthropic-messages,
-    // so we only strip chat-only fields here. The same upstream gate that
-    // fingerprints the chat quartet also fingerprints the Messages request,
-    // so inject the same no-op tool declarations so union-alpha doesn't 403.
-    if (isAnthropicMessagesModel(model) && body && typeof body === "object") {
+    } else if (isAnthropicMessagesModel(model) && body && typeof body === "object") {
+      requestFormat = "anthropic-messages";
       delete body.max_output_tokens;
       if (body.max_tokens === undefined || body.max_tokens < 16) {
         body.max_tokens = 100000;
       }
       normalizeOpencodeReasoning(model, body);
-      ensureChatFingerprintTools(body, model);
-      return injectReasoningContent({ provider: this.provider, model, body });
     }
-    if (body && typeof body === "object") {
-      ensureChatFingerprintTools(body, model);
+
+    const transformedBody = injectReasoningContent({ provider: this.provider, model, body });
+    const prepared = prepareFreeTierRequest(
+      transformedBody,
+      requestFormat,
+      "zen",
+      this.provider,
+      model,
+      credentials?.[CONTRACT_SESSION_FIELD],
+    );
+    if (credentials && typeof credentials === "object") {
+      credentials[CONTRACT_ATTEMPT_FIELD] = prepared.attempt;
     }
-    return injectReasoningContent({ provider: this.provider, model, body });
+    return prepared.body;
   }
 
   buildUrl(model) {
@@ -510,20 +304,21 @@ export class OpenCodeExecutor extends BaseExecutor {
     return `${base}/zen/v1/chat/completions`;
   }
 
-  buildHeaders(credentials, stream = true) {
+  buildHeaders(credentials, stream = true, url = null, model = "") {
     const raw = credentials?.rawHeaders || {};
     const lower = {};
     for (const [k, v] of Object.entries(raw)) lower[k.toLowerCase()] = v;
 
     const downstreamUa = lower["user-agent"] || "";
     const downstreamClient = lower["x-opencode-client"];
-    // ponytail: only rotate when the downstream client didn't pin a UA /
-    // x-opencode-client of their own. A pinned downstream client (e.g. an
-    // actual opencode CLI instance) should get its own headers echoed back,
-    // not the rotated variant. When the downstream pinned neither, we still
-    // need defaults, so fall back to a non-rotating canonical entry.
-    const isOpencodeDownstream = hasValidOpencodeVersion(downstreamUa);
-    const rotated = rotateFingerprint();
+    const gated = isGatedFreeTierRequest("zen", this.provider, model);
+    const synthesize = !/^(0|false|no|off)$/i.test(process.env.OPENCODE_SYNTHESIZE_CLI_HEADERS?.trim() || "");
+    const configuredUa = process.env.OPENCODE_USER_AGENT?.trim();
+    const defaultUa = configuredUa && (!gated || hasValidOpencodeVersion(configuredUa))
+      ? configuredUa : OPENCODE_UA;
+    const userAgent = hasValidOpencodeVersion(downstreamUa) ? downstreamUa : (synthesize ? defaultUa : null);
+    const client = downstreamClient || (synthesize ? process.env.OPENCODE_CLIENT?.trim() || "desktop" : null);
+    const project = lower["x-opencode-project"] || (synthesize ? process.env.OPENCODE_PROJECT?.trim() || "global" : null);
 
     const prepared = credentials?.[SESSION_FIELD]
       || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
@@ -531,12 +326,12 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
-      "User-Agent": isOpencodeDownstream ? downstreamUa : rotated.ua,
-      "x-opencode-client": downstreamClient || rotated.client,
+      ...(userAgent ? { "User-Agent": userAgent } : {}),
+      ...(client ? { "x-opencode-client": client } : {}),
       "x-opencode-session": prepared,
       "x-opencode-request": lower["x-opencode-request"] || generateRequestId(),
-      "x-opencode-project": lower["x-opencode-project"] || resolveProjectId(),
-      "Accept": stream ? "text/event-stream" : "*/*",
+      ...(project ? { "x-opencode-project": project } : {}),
+      "Accept": stream || gated ? "text/event-stream" : "*/*",
       "Accept-Language": lower["accept-language"] || "*",
       "sec-fetch-mode": lower["sec-fetch-mode"] || "cors",
       "Accept-Encoding": lower["accept-encoding"] || "br, gzip, deflate",
@@ -551,25 +346,23 @@ export class OpenCodeExecutor extends BaseExecutor {
   // a per-request Bun spawn — overhead is ~30ms cold. For high-throughput,
   // promote to a long-lived Bun child process that streams many requests.
   async execute({ model, body, stream, credentials, signal, log, providerSessionId, clientTool, ...rest }) {
-    // ponytail: load the opencode desktop's active session id from its window
-    // data file before building headers. Without this, the server returns 403
-    // because fresh session ids are not in the active-session table. Cache
-    // miss is fine — the executor falls back to a generated descending id.
-    if (!this._persistedSession) {
-      try { this._persistedSession = await readActiveOpencodeSession(); }
-      catch { this._persistedSession = null; }
-    }
+    const clientRequestedStream = stream;
     const preparedCredentials = this.prepareRequestCredentials({ body, credentials, providerSessionId, clientTool });
-    // ponytail: surface the desktop session id to the resolver as a soft
-    // override so translateSessionId() hashes it deterministically rather
-    // than the conversation session. Lets a single pinned session serve
-    // many concurrent conversations without per-conversation 403s.
-    if (this._persistedSession && preparedCredentials[SESSION_FIELD] === generateSessionId()) {
-      // skip — fallback path, don't override
-    }
     const url = this.buildUrl(model, stream, 0, preparedCredentials);
-    const transformedBody = this.transformRequest(model, body, stream, preparedCredentials);
-    const headers = this.buildHeaders(preparedCredentials, stream, url, model);
+    const transformedBody = this.transformRequest(model, { ...body, stream: !!stream }, stream, preparedCredentials);
+    const upstreamStream = transformedBody?.stream === true;
+    const headers = this.buildHeaders(preparedCredentials, upstreamStream, url, model);
+    const attempt = preparedCredentials[CONTRACT_ATTEMPT_FIELD];
+    const finalize = (result) => {
+      noteFreeTierOutcome(attempt, result.response.ok);
+      if (clientRequestedStream || !attempt) return result;
+      const response = rebuildJsonFromForcedStream(
+        result.response,
+        requestFormatForModel(model),
+        model,
+      );
+      return response === result.response ? result : { ...result, response };
+    };
 
     const bunBin = process.env.BUN_BIN?.trim() || "bun";
     // ponytail: Next.js rewrites `import.meta.url` so the inlined path is
@@ -593,7 +386,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       url,
       headers,
       body: JSON.stringify(transformedBody),
-      stream: !!stream,
+      stream: upstreamStream,
       // ponytail: opencode rate-limits per source IP. Pass the connection
       // proxy from the virtual noauth credentials so Bun's fetch() tunnels
       // out via that pool, refreshing the upstream rate-limit bucket.
@@ -611,12 +404,12 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (signal) {
       const onAbort = () => { if (!child.killed) child.kill("SIGTERM"); };
       signal.addEventListener("abort", onAbort, { once: true });
-      child.on("exit", () => signal.removeEventListener?.("abort", onAbort));
+      child.on("close", () => signal.removeEventListener?.("abort", onAbort));
     }
 
     child.stdin.end(input);
 
-    if (stream) {
+    if (upstreamStream) {
       // Wait for the metadata line before constructing Response. Returning
       // early would default every upstream error to HTTP 200 and turn its body
       // into an apparently successful empty SSE stream.
@@ -624,8 +417,10 @@ export class OpenCodeExecutor extends BaseExecutor {
         let headerBuf = Buffer.alloc(0);
         let controller = null;
         let stderr = "";
+        let ended = false;
 
         child.stdout.on("data", (chunk) => {
+          if (ended) return;
           if (controller) {
             controller.enqueue(chunk);
             return;
@@ -647,18 +442,26 @@ export class OpenCodeExecutor extends BaseExecutor {
               controller = streamController;
               if (tail.length) controller.enqueue(tail);
             },
+            cancel() {
+              ended = true;
+              if (!child.killed) child.kill("SIGTERM");
+            },
           });
-          resolve({
+          resolve(finalize({
             response: new Response(responseBody, { status: metadata.status, headers: metadata.headers || {} }),
             url, headers, transformedBody,
-          });
+          }));
         });
         child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
         child.on("error", (error) => {
+          if (ended) return;
+          ended = true;
           if (controller) controller.error(error);
           else reject(error);
         });
-        child.on("exit", (code) => {
+        child.on("close", (code) => {
+          if (ended) return;
+          ended = true;
           if (!controller) {
             reject(new Error(`opencode Bun fetcher exited before metadata (exit=${code}) stderr=${stderr.slice(0, 500)}`));
           } else if (code !== 0) {
@@ -677,7 +480,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     child.stderr.on("data", (c) => stderrChunks.push(c));
     return new Promise((resolve, reject) => {
       child.on("error", reject);
-      child.on("exit", (code) => {
+      child.on("close", (code) => {
         const stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 500);
         if (code === 0) {
           let parsed;
@@ -686,21 +489,13 @@ export class OpenCodeExecutor extends BaseExecutor {
           } catch (e) {
             return reject(new Error(`opencode Bun fetcher: bad JSON output: ${e.message}`));
           }
-          // ponytail: Bun's response reached us but upstream returned an error
-          // (e.g. 429 FreeUsageLimitError, 503). Try the Node fallback before
-          // surfacing the error to the caller — Node's undici TLS is a
-          // separate rate-limit bucket on opencode's free-tier gate, so it
-          // often still works when Bun is rate-limited.
-          if (parsed.status >= 400 && parsed.status < 600) {
-            return tryNodeFallback({ resolve, reject, input, url, headers, transformedBody, bunStatus: parsed.status, bunBody: parsed.body });
-          }
-          return resolve({
+          return resolve(finalize({
             response: new Response(parsed.body, {
               status: parsed.status,
               headers: parsed.headers,
             }),
             url, headers, transformedBody,
-          });
+          }));
         }
         // ponytail: Bun hit a runtime error (TLS fingerprint rejection, rate-limit,
         // cwd issue). Fall back to a Node.js-native fetcher that uses undici's
@@ -708,7 +503,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         // free-tier gate rate-limits them as separate buckets. When Bun is
         // burned (FreeUsageLimitError), Node often still works through a
         // different code path on the same IP.
-        return tryNodeFallback({ resolve, reject, input, url, headers, transformedBody, bunCode: code, bunStderr: stderr });
+        return tryNodeFallback({ resolve: (result) => resolve(finalize(result)), reject, input, url, headers, transformedBody, bunCode: code, bunStderr: stderr });
       });
     });
   }
@@ -739,7 +534,7 @@ async function tryNodeFallback({ resolve, reject, input, url, headers, transform
   nodeChild.stdout.on("data", (c) => out.push(c));
   nodeChild.stderr.on("data", (c) => err.push(c));
   nodeChild.on("error", () => reject(new Error(`node-fallback spawn error`)));
-  nodeChild.on("exit", (ncode) => {
+  nodeChild.on("close", (ncode) => {
     if (ncode !== 0) {
       return reject(new Error(`opencode node-fallback exit=${ncode} stderr=${Buffer.concat(err).toString("utf8").slice(0, 500)}`));
     }

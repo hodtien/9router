@@ -85,6 +85,24 @@ describe("non-stream Chat upstream for a Responses-API client (op-ericding bug)"
   });
 });
 
+describe("Responses JSON upstream for Chat and Claude clients", () => {
+  const body = {
+    id: "resp-1", object: "response", status: "completed", model: "muse-spark-1.3-contributor-free",
+    output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] }],
+    usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+  };
+  it("converts Responses output into Chat choices", () => {
+    const out = translateNonStreamingResponse(body, FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI);
+    expect(out.object).toBe("chat.completion");
+    expect(out.choices[0].message.content).toBe("hello");
+  });
+  it("converts Responses output into Claude content", () => {
+    const out = translateNonStreamingResponse(body, FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE);
+    expect(out.type).toBe("message");
+    expect(out.content).toContainEqual({ type: "text", text: "hello" });
+  });
+});
+
 describe("forced-SSE JSON path for a Responses-API client behind a chat upstream", () => {
   const sseCtx = (sourceFormat, targetFormat) => {
     const encoder = new TextEncoder();

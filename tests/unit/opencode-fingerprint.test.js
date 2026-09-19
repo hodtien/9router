@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   OPENCODE_SESSION_RE,
   generateSessionId,
@@ -111,35 +111,57 @@ describe("OpenCode Free prepareRequestCredentials (request-local session)", () =
     })._opencodeSession;
     expect(first).toBe(second);
   });
+
+  it("scopes tool observations only by a caller-supplied OpenCode session", () => {
+    const executor = new OpenCodeExecutor();
+    const synthesized = executor.prepareRequestCredentials({
+      body: { messages: [{ role: "user", content: "hi" }] },
+      credentials: makeCredentials(),
+      providerSessionId: "conversation-a",
+    });
+    const supplied = executor.prepareRequestCredentials({
+      body: { messages: [{ role: "user", content: "hi" }] },
+      credentials: makeCredentials({ rawHeaders: { "X-Session-Id": " caller-session " } }),
+      providerSessionId: "conversation-a",
+    });
+
+    expect(synthesized._opencodeContractSession).toBeUndefined();
+    expect(supplied._opencodeContractSession).toBe("caller-session");
+  });
 });
 
 describe("OpenCode Free User-Agent Validation", () => {
-  it("rotates the User-Agent across the pool for non-opencode downstream clients", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("uses stable versioned defaults without rotating caller identity", () => {
     const executor = new OpenCodeExecutor();
-    const uas = new Set();
-    for (let i = 0; i < 6; i++) {
-      const headers = executor.buildHeaders({});
-      uas.add(headers["User-Agent"]);
-    }
-    // ponytail: rotation should hit at least 3 of the 5 pool entries across
-    // 6 consecutive calls. If it stays at 1, rotation is broken.
-    expect(uas.size).toBeGreaterThanOrEqual(3);
-    for (const ua of uas) {
-      expect(ua).toMatch(/^opencode\/1\.(1[7-9]|18)\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/bun\/\d+\.\d+\.\d+$/);
-    }
+    const first = executor.buildHeaders({});
+    const second = executor.buildHeaders({});
+    expect(first["User-Agent"]).toBe("opencode/1.18.31");
+    expect(second["User-Agent"]).toBe(first["User-Agent"]);
+    expect(first["x-opencode-client"]).toBe("desktop");
   });
 
-  it("rotates x-opencode-client across the pool for non-opencode downstream clients", () => {
+  it("honors configured defaults and repairs a stale UA only for gated models", () => {
+    vi.stubEnv("OPENCODE_USER_AGENT", "opencode-cli/1.0.0");
+    vi.stubEnv("OPENCODE_CLIENT", "cli");
+    vi.stubEnv("OPENCODE_PROJECT", "project-test");
     const executor = new OpenCodeExecutor();
-    const clients = new Set();
-    for (let i = 0; i < 8; i++) {
-      const headers = executor.buildHeaders({});
-      clients.add(headers["x-opencode-client"]);
-    }
-    expect(clients.size).toBeGreaterThanOrEqual(2);
-    for (const c of clients) {
-      expect(["desktop", "cli", "desktop-app", "cli-app"]).toContain(c);
-    }
+    const free = executor.buildHeaders({}, false, null, "mimo-v2.5-free");
+    const paid = executor.buildHeaders({}, false, null, "paid-model");
+    expect(free["User-Agent"]).toBe("opencode/1.18.31");
+    expect(free.Accept).toBe("text/event-stream");
+    expect(free["x-opencode-client"]).toBe("cli");
+    expect(free["x-opencode-project"]).toBe("project-test");
+    expect(paid["User-Agent"]).toBe("opencode-cli/1.0.0");
+  });
+
+  it("supports disabling header synthesis", () => {
+    vi.stubEnv("OPENCODE_SYNTHESIZE_CLI_HEADERS", "false");
+    const headers = new OpenCodeExecutor().buildHeaders({});
+    expect(headers).not.toHaveProperty("User-Agent");
+    expect(headers).not.toHaveProperty("x-opencode-client");
+    expect(headers).not.toHaveProperty("x-opencode-project");
   });
 
   it("preserves a downstream opencode UA verbatim and does not rotate it", () => {
@@ -158,15 +180,15 @@ describe("OpenCode Free User-Agent Validation", () => {
     expect(headers["x-opencode-client"]).toBe("tui");
   });
 
-  it("upgrades outdated opencode versions (< 1.17) but still rotates", () => {
+  it("upgrades outdated opencode versions (< 1.17) to the stable default", () => {
     const executor = new OpenCodeExecutor();
     const headers = executor.buildHeaders({ rawHeaders: { "user-agent": "opencode/1.15.0" } });
     expect(headers["User-Agent"]).toMatch(/^opencode\/1\.18\./);
   });
 });
 
-describe("OpenCode Free Upstream Gates (stream + tool fingerprint + reasoning strip)", () => {
-  it("forces stream:true on chat bodies even for non-stream clients", () => {
+describe("OpenCode free-tier request contract and Responses normalization", () => {
+  it("forces stream and adds one protocol-correct placeholder for gated Chat requests", () => {
     const executor = new OpenCodeExecutor();
     const out = executor.transformRequest(
       "mimo-v2.5-free",
@@ -175,42 +197,22 @@ describe("OpenCode Free Upstream Gates (stream + tool fingerprint + reasoning st
       makeCredentials(),
     );
     expect(out.stream).toBe(true);
+    expect(out.tools.map((tool) => tool.function?.name)).toEqual(["_noop"]);
   });
 
-  it("injects the file-search quartet {bash,glob,grep,read} into chat bodies without tools", () => {
+  it("preserves caller Chat tools without appending placeholders", () => {
     const executor = new OpenCodeExecutor();
+    const tool = { type: "function", function: { name: "my_tool", description: "m", parameters: { type: "object", properties: {} } } };
     const out = executor.transformRequest(
       "mimo-v2.5-free",
-      { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] },
+      { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }], tools: [tool] },
       true,
       makeCredentials(),
     );
-    const names = out.tools.map((t) => t.function?.name);
-    for (const required of ["bash", "glob", "grep", "read"]) {
-      expect(names).toContain(required);
-    }
+    expect(out.tools).toEqual([tool]);
   });
 
-  it("preserves caller chat tools and only appends missing fingerprint names", () => {
-    const executor = new OpenCodeExecutor();
-    const out = executor.transformRequest(
-      "mimo-v2.5-free",
-      {
-        model: "mimo-v2.5-free",
-        messages: [{ role: "user", content: "hi" }],
-        tools: [{ type: "function", function: { name: "my_tool", description: "m", parameters: { type: "object", properties: {} } } }],
-      },
-      true,
-      makeCredentials(),
-    );
-    const names = out.tools.map((t) => t.function?.name);
-    expect(names[0]).toBe("my_tool");
-    for (const required of ["bash", "glob", "grep", "read"]) {
-      expect(names).toContain(required);
-    }
-  });
-
-  it("injects fingerprint into Responses bodies and keeps stream/store gates", () => {
+  it("uses the flat placeholder shape for gated Responses requests", () => {
     const executor = new OpenCodeExecutor();
     const out = executor.transformRequest(
       "muse-spark-1.3-contributor-free",
@@ -220,13 +222,10 @@ describe("OpenCode Free Upstream Gates (stream + tool fingerprint + reasoning st
     );
     expect(out.stream).toBe(true);
     expect(out.store).toBe(false);
-    const names = out.tools.map((t) => t.name);
-    for (const required of ["bash", "glob", "grep", "read"]) {
-      expect(names).toContain(required);
-    }
+    expect(out.tools.map((tool) => tool.name)).toEqual(["_noop"]);
   });
 
-  it("strips prior-turn reasoning items carrying encrypted_content from input", () => {
+  it("strips prior-turn Responses reasoning items carrying encrypted_content", () => {
     const executor = new OpenCodeExecutor();
     const model = "muse-spark-1.3-contributor-free";
     const body = {
@@ -239,91 +238,24 @@ describe("OpenCode Free Upstream Gates (stream + tool fingerprint + reasoning st
       ],
     };
     const out = executor.transformRequest(model, body, true, makeCredentials());
-    expect(out.input.some((i) => i.type === "reasoning")).toBe(false);
+    expect(out.input.some((item) => item.type === "reasoning")).toBe(false);
     expect(JSON.stringify(out.input)).not.toContain("ENC_BLOB_TURN_1");
   });
 
-  it("injects the fingerprint into Anthropic Messages bodies (union-alpha)", () => {
+  it("does not guess an OpenAI tool shape for union-alpha Messages requests", () => {
     const executor = new OpenCodeExecutor();
     const out = executor.transformRequest(
       "union-alpha",
       { model: "union-alpha", messages: [{ role: "user", content: "hi" }], max_tokens: 100 },
-      true,
+      false,
       makeCredentials(),
     );
-    const names = (out.tools || []).map((t) => t.function?.name ?? t.name);
-    for (const required of ["bash", "glob", "grep", "read"]) {
-      expect(names).toContain(required);
-    }
+    expect(out).not.toHaveProperty("tools");
+    expect(out).not.toHaveProperty("stream");
   });
 
-  it("declares forceStream on the opencode transport so chatCore serves SSE upstream", async () => {
+  it("does not force every OpenCode request to stream at provider scope", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS["opencode"]?.forceStream).toBe(true);
-  });
-});
-
-describe("OpenCode Free tool observation cache (PR #14013)", () => {
-  beforeEach(async () => {
-    const mod = await import("../../open-sse/executors/opencodeToolFingerprint.js");
-    mod._resetOpencodeFingerprintCacheForTests();
-  });
-
-  it("returns the default quartet when no success has been recorded", async () => {
-    const { resolveOpencodeToolFingerprint, DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
-    expect(resolveOpencodeToolFingerprint("some-model")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
-    // ponytail: must not hand out the internal array — callers mutate freely.
-    expect(resolveOpencodeToolFingerprint("some-model")).not.toBe(DEFAULT_OPENCODE_FINGERPRINT);
-  });
-
-  it("promotes a successful response's tool names into the model cache", async () => {
-    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
-    noteOpencodeFingerprintSuccess("mimo-v2.5-free", ["bash", "glob", "grep", "read", "webfetch", "todowrite"]);
-    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toEqual([
-      "bash", "glob", "grep", "read", "webfetch", "todowrite",
-    ]);
-    // other models untouched
-    const { DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
-    expect(resolveOpencodeToolFingerprint("union-alpha")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
-  });
-
-  it("drops the learned list after 3 consecutive 403 refusals and returns to the default", async () => {
-    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess, noteOpencodeFingerprintRefusal, DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
-    noteOpencodeFingerprintSuccess("mimo-v2.5-free", ["bash", "glob", "read", "list", "write", "todowrite"]);
-    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toContain("todowrite");
-
-    noteOpencodeFingerprintRefusal("mimo-v2.5-free");
-    noteOpencodeFingerprintRefusal("mimo-v2.5-free");
-    // still cached — two refusals don't drop
-    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toContain("todowrite");
-
-    noteOpencodeFingerprintRefusal("mimo-v2.5-free");
-    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
-  });
-
-  it("ignores empty / non-string tool name arrays on success", async () => {
-    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess, DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
-    noteOpencodeFingerprintSuccess("mimo-v2.5-free", []);
-    noteOpencodeFingerprintSuccess("mimo-v2.5-free", null);
-    noteOpencodeFingerprintSuccess("mimo-v2.5-free", [null, 1, "", "  ", { toString: () => "" }]);
-    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
-  });
-
-  it("executor uses the model-level observed tools (chat shape)", async () => {
-    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
-    noteOpencodeFingerprintSuccess("mimo-v2.5-free", ["bash", "glob", "read", "list", "write"]);
-    const executor = new OpenCodeExecutor();
-    const out = executor.transformRequest(
-      "mimo-v2.5-free",
-      { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] },
-      true,
-      makeCredentials(),
-    );
-    const names = out.tools.map((t) => t.function?.name);
-    for (const required of ["bash", "glob", "read", "list", "write"]) {
-      expect(names).toContain(required);
-    }
-    // default names not in the observed set are no longer added
-    expect(names).not.toContain("grep");
+    expect(PROVIDERS.opencode?.forceStream).not.toBe(true);
   });
 });
