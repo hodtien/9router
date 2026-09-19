@@ -30,6 +30,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { noteOpencodeFingerprintSuccess, noteOpencodeFingerprintRefusal } from "../executors/opencodeToolFingerprint.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -452,6 +453,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Provider returned error
   if (!providerResponse.ok) {
     trackPendingRequest(model, provider, connectionId, false, true);
+    // ponytail: PR #14013 — bump the opencode tool-fingerprint refusal counter
+    // on 403/451 (the free-tier gate). After 3 consecutive refusals the cache
+    // drops the learned tool list back to the default, so we self-heal when
+    // the upstream rotates its accepted set.
+    if (provider === "opencode") {
+      try {
+        if (providerResponse.status === 403 || providerResponse.status === 451) {
+          noteOpencodeFingerprintRefusal(model);
+        }
+      } catch { /* never block error reporting on cache bookkeeping */ }
+    }
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
@@ -472,6 +484,23 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     }
     reqLogger.logError(new Error(message), finalBody || translatedBody);
     return createErrorResult(statusCode, errMsg, resetsAtMs);
+  }
+
+  // ponytail: PR #14013 — a 200 proves the upstream accepted our declared
+  // tool names. Promote them into the per-model observation cache so future
+  // requests skip the trial-and-error phase. Best-effort only.
+  if (provider === "opencode" && finalBody && Array.isArray(finalBody.tools) && finalBody.tools.length) {
+    try {
+      const observedNames = finalBody.tools
+        .map((t) => {
+          if (!t || typeof t !== "object") return "";
+          if (typeof t.name === "string") return t.name.trim();
+          if (t.function && typeof t.function === "object" && typeof t.function.name === "string") return t.function.name.trim();
+          return "";
+        })
+        .filter(Boolean);
+      if (observedNames.length) noteOpencodeFingerprintSuccess(model, observedNames);
+    } catch { /* never block the success path on cache bookkeeping */ }
   }
 
   const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };

@@ -262,3 +262,68 @@ describe("OpenCode Free Upstream Gates (stream + tool fingerprint + reasoning st
     expect(PROVIDERS["opencode"]?.forceStream).toBe(true);
   });
 });
+
+describe("OpenCode Free tool observation cache (PR #14013)", () => {
+  beforeEach(async () => {
+    const mod = await import("../../open-sse/executors/opencodeToolFingerprint.js");
+    mod._resetOpencodeFingerprintCacheForTests();
+  });
+
+  it("returns the default quartet when no success has been recorded", async () => {
+    const { resolveOpencodeToolFingerprint, DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
+    expect(resolveOpencodeToolFingerprint("some-model")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
+    // ponytail: must not hand out the internal array — callers mutate freely.
+    expect(resolveOpencodeToolFingerprint("some-model")).not.toBe(DEFAULT_OPENCODE_FINGERPRINT);
+  });
+
+  it("promotes a successful response's tool names into the model cache", async () => {
+    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
+    noteOpencodeFingerprintSuccess("mimo-v2.5-free", ["bash", "glob", "grep", "read", "webfetch", "todowrite"]);
+    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toEqual([
+      "bash", "glob", "grep", "read", "webfetch", "todowrite",
+    ]);
+    // other models untouched
+    const { DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
+    expect(resolveOpencodeToolFingerprint("union-alpha")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
+  });
+
+  it("drops the learned list after 3 consecutive 403 refusals and returns to the default", async () => {
+    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess, noteOpencodeFingerprintRefusal, DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
+    noteOpencodeFingerprintSuccess("mimo-v2.5-free", ["bash", "glob", "read", "list", "write", "todowrite"]);
+    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toContain("todowrite");
+
+    noteOpencodeFingerprintRefusal("mimo-v2.5-free");
+    noteOpencodeFingerprintRefusal("mimo-v2.5-free");
+    // still cached — two refusals don't drop
+    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toContain("todowrite");
+
+    noteOpencodeFingerprintRefusal("mimo-v2.5-free");
+    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
+  });
+
+  it("ignores empty / non-string tool name arrays on success", async () => {
+    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess, DEFAULT_OPENCODE_FINGERPRINT } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
+    noteOpencodeFingerprintSuccess("mimo-v2.5-free", []);
+    noteOpencodeFingerprintSuccess("mimo-v2.5-free", null);
+    noteOpencodeFingerprintSuccess("mimo-v2.5-free", [null, 1, "", "  ", { toString: () => "" }]);
+    expect(resolveOpencodeToolFingerprint("mimo-v2.5-free")).toEqual(DEFAULT_OPENCODE_FINGERPRINT);
+  });
+
+  it("executor uses the model-level observed tools (chat shape)", async () => {
+    const { resolveOpencodeToolFingerprint, noteOpencodeFingerprintSuccess } = await import("../../open-sse/executors/opencodeToolFingerprint.js");
+    noteOpencodeFingerprintSuccess("mimo-v2.5-free", ["bash", "glob", "read", "list", "write"]);
+    const executor = new OpenCodeExecutor();
+    const out = executor.transformRequest(
+      "mimo-v2.5-free",
+      { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] },
+      true,
+      makeCredentials(),
+    );
+    const names = out.tools.map((t) => t.function?.name);
+    for (const required of ["bash", "glob", "read", "list", "write"]) {
+      expect(names).toContain(required);
+    }
+    // default names not in the observed set are no longer added
+    expect(names).not.toContain("grep");
+  });
+});

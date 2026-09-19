@@ -60,6 +60,33 @@ let selectionMutex = Promise.resolve();
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
+// Upstream text emitted by opencode's free-tier gate when the request body /
+// tools / session fingerprint doesn't match what the opencode CLI would send.
+// Casing and apostrophe are preserved verbatim so we don't swallow a similar
+// 403 from a sibling provider.
+const OPENCODE_FREE_TIER_REFUSAL_TEXT = "OpenCode's free tier can only be used from within OpenCode";
+
+/**
+ * Returns true when `errorText` is the upstream opencode free-tier refusal.
+ * Scoped to opencode (alias-aware) and 403/451 only — other 403s (geo-block,
+ * user_blocked, fingerprint mismatch on paid tier) still flow into the normal
+ * lockout path because per-account cooldown is the right behavior there.
+ *
+ * The upstream error shape is `{ type: "FreeTierError", message: "..." }`,
+ * but by the time the text reaches `markAccountUnavailable`, the relay often
+ * surfaces only the `message` field, so matching the message substring is
+ * sufficient.
+ */
+export function isOpencodeFreeTierRefusal(provider, status, errorText) {
+  if (resolveProviderId(provider) !== "opencode") return false;
+  const code = Number(status);
+  if (code !== 403 && code !== 451) return false;
+  const text = typeof errorText === "string"
+    ? errorText
+    : (() => { try { return JSON.stringify(errorText); } catch { return ""; } })();
+  return text.includes(OPENCODE_FREE_TIER_REFUSAL_TEXT);
+}
+
 function githubMonthlyResetMs(status, errorText, provider) {
   if (resolveProviderId(provider) !== "github" || Number(status) !== 402) return null;
   if (!String(errorText || "").toLowerCase().includes(GITHUB_MONTHLY_USAGE_LIMIT)) return null;
@@ -106,6 +133,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
       return {
         id: "noauth",
+        connectionId: "noauth",
         connectionName: "Public",
         isActive: true,
         accessToken: "public",
@@ -290,6 +318,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
+
+  // ponytail: opencode free-tier refuses requests whose body / tools don't
+  // match the upstream contract (PR #14011 upstream). The refusal is scoped
+  // to the request, not the account — every sibling account answers the
+  // same request the same way, so a per-account lockout empties the pool.
+  // Skip the lock entirely and return the body unchanged.
+  if (isOpencodeFreeTierRefusal(provider, status, errorText)) {
+    log.warn("AUTH", `opencode free-tier refusal on ${connectionId.slice(0, 8)} [${status}] — no lockout`);
+    return { shouldFallback: true, cooldownMs: 0 };
+  }
+
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
@@ -297,7 +336,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   // GitHub premium-request exhaustion is account-wide until the next UTC month.
   const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
 
-  // Provider-specific precise cooldown (e.g. codex usage_limit_reached resets_at) overrides backoff
+  // Provider-specific precise cooldown (e.g. codex usage_limit_exached resets_at) overrides backoff
   let shouldFallback, cooldownMs, newBackoffLevel;
   if (githubResetAtMs) {
     shouldFallback = true;
