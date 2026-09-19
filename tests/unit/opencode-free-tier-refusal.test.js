@@ -1,12 +1,17 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  getProviderConnections: vi.fn(),
+  updateProviderConnection: vi.fn(),
+}));
 
 // ponytail: auth.js pulls in a heavy DB+network chain on import. The predicate
 // we want to test only reads its three arguments, so mock every collaborator
 // the module touches so ESM collection completes.
 vi.mock("@/lib/localDb", () => ({
-  getProviderConnections: vi.fn(),
+  getProviderConnections: mocks.getProviderConnections,
   validateApiKey: vi.fn(),
-  updateProviderConnection: vi.fn(),
+  updateProviderConnection: mocks.updateProviderConnection,
   getSettings: vi.fn(),
   getProxyPools: vi.fn(),
 }));
@@ -45,10 +50,15 @@ vi.mock("../../src/sse/utils/logger.js", () => ({
   error: vi.fn(),
 }));
 
-const { isOpencodeFreeTierRefusal } = await import("../../src/sse/services/auth.js");
+const { isOpencodeFreeTierRefusal, markAccountUnavailable } = await import("../../src/sse/services/auth.js");
 
 describe("isOpencodeFreeTierRefusal (PR #14011)", () => {
   const text = "OpenCode's free tier can only be used from within OpenCode";
+
+  beforeEach(() => {
+    mocks.getProviderConnections.mockReset();
+    mocks.updateProviderConnection.mockReset();
+  });
 
   it("matches the opencode 403 free-tier refusal verbatim", () => {
     expect(isOpencodeFreeTierRefusal("opencode", 403, text)).toBe(true);
@@ -82,5 +92,23 @@ describe("isOpencodeFreeTierRefusal (PR #14011)", () => {
   it("handles object errorText by JSON.stringifying it (defensive)", () => {
     expect(isOpencodeFreeTierRefusal("opencode", 403, { message: text })).toBe(true);
     expect(isOpencodeFreeTierRefusal("opencode", 403, { error: { code: 403 } })).toBe(false);
+  });
+
+  it("matches machine-token and opencode-family variants case-insensitively", () => {
+    expect(isOpencodeFreeTierRefusal("opencode-zen", 403, '{"error":{"type":"FreeTierError"}}')).toBe(true);
+    expect(isOpencodeFreeTierRefusal("OpenCode-Custom", 451, "FREETIERERROR")).toBe(true);
+  });
+
+  it("leaves fingerprint, geo and user_blocked refusals to their own handling", () => {
+    expect(isOpencodeFreeTierRefusal("opencode", 403, '{"error_code":1010,"error":{"type":"FreeTierError"}}')).toBe(false);
+    expect(isOpencodeFreeTierRefusal("opencode", 403, "FreeTierError: not available in your country")).toBe(false);
+    expect(isOpencodeFreeTierRefusal("opencode", 403, "FreeTierError: [user_blocked] egress refused")).toBe(false);
+  });
+
+  it("does not rotate or write account state for a request-scoped refusal", async () => {
+    const result = await markAccountUnavailable("account-1", 403, text, "opencode-zen", "mimo-v2.5-free");
+    expect(result).toEqual({ shouldFallback: false, cooldownMs: 0 });
+    expect(mocks.getProviderConnections).not.toHaveBeenCalled();
+    expect(mocks.updateProviderConnection).not.toHaveBeenCalled();
   });
 });

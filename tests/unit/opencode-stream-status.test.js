@@ -1,0 +1,210 @@
+import { EventEmitter } from "node:events";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { _resetToolObservationForTests, getObservedToolNames } from "../../open-sse/executors/opencodeToolObservation.js";
+
+const mocks = vi.hoisted(() => ({
+  spawn: vi.fn(),
+}));
+
+vi.mock("node:child_process", () => ({
+  spawn: mocks.spawn,
+}));
+
+const { OpenCodeExecutor } = await import("../../open-sse/executors/opencode.js");
+
+function makeChild(status, body, headers = { "content-type": "application/json" }, inputs = []) {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.killed = false;
+  child.kill = vi.fn(() => { child.killed = true; });
+  child.stdin = {
+    end: vi.fn((input) => {
+      inputs.push(JSON.parse(input));
+      queueMicrotask(() => {
+        const streaming = JSON.parse(input).stream;
+        child.stdout.emit("data", Buffer.from(streaming
+          ? `${JSON.stringify({ status, headers })}\n${body}`
+          : JSON.stringify({ status, headers, body })));
+        child.emit("exit", 0);
+        child.emit("close", 0);
+      });
+    }),
+  };
+  return child;
+}
+
+describe("OpenCode streaming transport status", () => {
+  beforeEach(() => _resetToolObservationForTests());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.OPENCODE_FETCHER_PATH;
+  });
+
+  it("waits for Bun metadata before constructing the upstream Response", async () => {
+    const upstreamBody = JSON.stringify({
+      type: "FreeTierError",
+      message: "OpenCode's free tier can only be used from within OpenCode",
+    });
+    mocks.spawn.mockReturnValue(makeChild(403, upstreamBody));
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    const result = await new OpenCodeExecutor().execute({
+      model: "mimo-v2.5-free",
+      body: { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials: { connectionId: "noauth", rawHeaders: {} },
+    });
+
+    expect(result.response.status).toBe(403);
+    expect(await result.response.text()).toContain("FreeTierError");
+  });
+
+  it("streams a gated Chat request upstream and rebuilds JSON for a JSON caller", async () => {
+    const inputs = [];
+    const sse = [
+      'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"mimo-v2.5-free","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}',
+      'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"mimo-v2.5-free","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+      "data: [DONE]",
+      "",
+    ].join("\n\n");
+    mocks.spawn.mockReturnValue(makeChild(200, sse, { "content-type": "text/event-stream" }, inputs));
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    const result = await new OpenCodeExecutor().execute({
+      model: "mimo-v2.5-free",
+      body: { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { connectionId: "noauth", rawHeaders: {} },
+      providerSessionId: "conversation-a",
+    });
+
+    expect(inputs[0].stream).toBe(true);
+    expect(JSON.parse(inputs[0].body)).toMatchObject({ stream: true });
+    expect(inputs[0].headers.Accept).toBe("text/event-stream");
+    expect(result.response.headers.get("content-type")).toContain("application/json");
+    expect(await result.response.json()).toMatchObject({
+      object: "chat.completion",
+      choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+    });
+  });
+
+  it("drains stdout arriving after process exit before closing the stream", async () => {
+    const child = makeChild(200, "");
+    child.stdin.end = vi.fn(() => queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from('{"status":200,"headers":{"content-type":"text/event-stream"}}\nfirst'));
+      child.emit("exit", 0);
+      child.stdout.emit("data", Buffer.from("last"));
+      child.emit("close", 0);
+    }));
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+    const result = await new OpenCodeExecutor().execute({
+      model: "mimo-v2.5-free", body: { messages: [] }, stream: true, credentials: {},
+    });
+    expect(await result.response.text()).toBe("firstlast");
+  });
+
+  it("cancels the child without throwing when more data or exit arrives", async () => {
+    const child = makeChild(200, "", { "content-type": "text/event-stream" });
+    child.stdin.end = vi.fn(() => queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from('{"status":200,"headers":{"content-type":"text/event-stream"}}\n'));
+    }));
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+    const result = await new OpenCodeExecutor().execute({
+      model: "mimo-v2.5-free", body: { messages: [] }, stream: true, credentials: {},
+    });
+    await result.response.body.cancel();
+    expect(() => child.stdout.emit("data", Buffer.from("late data"))).not.toThrow();
+    expect(() => child.emit("exit", 0)).not.toThrow();
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("honors a streaming caller outside the gated model catalog", async () => {
+    const inputs = [];
+    mocks.spawn.mockReturnValue(makeChild(200, "data: hello\n\n", { "content-type": "text/event-stream" }, inputs));
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+    const result = await new OpenCodeExecutor().execute({
+      model: "union-alpha", body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true, credentials: {},
+    });
+    expect(inputs[0].stream).toBe(true);
+    expect(JSON.parse(inputs[0].body).stream).toBe(true);
+    expect(await result.response.text()).toBe("data: hello\n\n");
+  });
+
+  it("preserves non-streaming refusals without a second transport attempt", async () => {
+    const inputs = [];
+    const refusal = JSON.stringify({ type: "FreeTierError", message: "free tier can only be used within OpenCode" });
+    mocks.spawn.mockClear();
+    mocks.spawn.mockReturnValue(makeChild(403, refusal, { "content-type": "application/json" }, inputs));
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+    const result = await new OpenCodeExecutor().execute({
+      model: "union-alpha", body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false, credentials: {},
+    });
+    expect(result.response.status).toBe(403);
+    expect(await result.response.text()).toBe(refusal);
+    expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("learns caller names and borrows the session list without learning placeholders", async () => {
+    const executor = new OpenCodeExecutor();
+    const inputs = [];
+    const model = "mimo-v2.5-free";
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+    const request = async (session, names, status = 200) => {
+      mocks.spawn.mockReturnValue(makeChild(status, "{}", { "content-type": "application/json" }, inputs));
+      const result = await executor.execute({
+        model,
+        body: { messages: [{ role: "user", content: "hi" }], ...(names ? { tools: names.map((name) => ({ type: "function", function: { name } })) } : {}) },
+        stream: true,
+        credentials: { rawHeaders: { "x-opencode-session": session } },
+      });
+      await result.response.text();
+    };
+    await request("a");
+    expect(getObservedToolNames("opencode", model)).toBeNull();
+    await request("a", ["tool_a"]);
+    await request("b", ["tool_b"]);
+    await request("a");
+    expect(JSON.parse(inputs.at(-1).body).tools.map((tool) => tool.function.name)).toEqual(["tool_a"]);
+    expect(getObservedToolNames("opencode", model)).toEqual(["tool_b"]);
+    await request("a", ["rejected"], 403);
+    expect(getObservedToolNames("opencode", model, "a")).toEqual(["tool_a"]);
+    for (let i = 0; i < 3; i++) await request("a", null, 403);
+    expect(getObservedToolNames("opencode", model, "a")).toBeNull();
+    expect(getObservedToolNames("opencode", model)).toEqual(["tool_b"]);
+  });
+
+  it("rebuilds a gated Responses stream for a JSON caller", async () => {
+    const inputs = [];
+    const sse = [
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"resp-1","created_at":1}}',
+      'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}',
+      "",
+    ].join("\n\n");
+    mocks.spawn.mockReturnValue(makeChild(200, sse, { "content-type": "text/event-stream" }, inputs));
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    const result = await new OpenCodeExecutor().execute({
+      model: "muse-spark-1.3-contributor-free",
+      body: { model: "muse-spark-1.3-contributor-free", input: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: { connectionId: "noauth", rawHeaders: {} },
+      providerSessionId: "conversation-a",
+    });
+
+    expect(inputs[0].stream).toBe(true);
+    expect(JSON.parse(inputs[0].body)).toMatchObject({ stream: true });
+    expect(await result.response.json()).toMatchObject({
+      id: "resp-1",
+      object: "response",
+      status: "completed",
+      output: [{ type: "message", role: "assistant" }],
+      usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+    });
+  });
+});
