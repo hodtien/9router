@@ -38,6 +38,9 @@ const STRIP_RULES = [
     match: /(^|\/)fugu(-ultra)?(-[0-9]+)?$/i,
     dropReasoningObjectUnless: { field: "reasoning", allow: ["high", "xhigh", "max"] },
   },
+  // MiMo Desktop Preview models (account-service route): content must be plain string,
+  // rejects OpenAI content-part array. Cloud models keep their parts (mimo-v2-omni is multi-modal).
+  { provider: "xiaomi-mimo", match: /preview/i, flattenContent: true },
   { provider: "volcengine-ark", match: /glm-5/i, clampToModelMaxOutput: true },
   // VolcEngine Ark caps the Kimi family at max_tokens <= 32768, but the model's
   // advertised ceiling is far higher (Kimi-K2.7-Code resolves to maxOutput 262144),
