@@ -24,9 +24,9 @@ export default {
     // /chat/completions, so the format is declared per-model, not per-provider.
     { id: "muse-spark-1.2-contributor-free", name: "Muse Spark 1.2 Contributor Free", targetFormat: "openai-responses" },
     { id: "muse-spark-1.3-contributor-free", name: "Muse Spark 1.3 Contributor Free", targetFormat: "openai-responses" },
-    // ponytail: union-alpha lives on /zen/v1/messages (Anthropic Messages
-    // protocol). Same Bearer-public free gate, same session header shape.
-    { id: "union-alpha", name: "Union Alpha Free", targetFormat: "claude" },
+    // union-alpha removed 2026-09-19: Zen returns 401 "Model not supported"
+    // for this id; upstream OpenCode retired it. Re-add only if Zen brings
+    // it back under a confirmed free-tier contract.
   ],
   modelsFetcher: { url: "https://opencode.ai/zen/v1/models", type: "opencode-free" },
   passthroughModels: true,

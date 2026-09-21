@@ -17,6 +17,10 @@ const OPENCODE_FREE_MODELS = new Set([
 const PLACEHOLDER_TOOL_NAME = "_noop";
 const PLACEHOLDER_TOOL_DESCRIPTION = "Do not call this tool. It exists only for API compatibility and must never be invoked.";
 const PLACEHOLDER_TOOL_PARAMETERS = { type: "object", properties: {} };
+const DEFAULT_RECOVERY_TOOL_NAMES = Object.freeze([
+  "bash", "edit", "glob", "grep", "read", "skill", "task",
+  "todowrite", "webfetch", "websearch", "write",
+]);
 const NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 
 export function isPremiumOpencodeModel(model, provider) {
@@ -40,9 +44,9 @@ export function requiresFreeTierRequestContract(surface, provider, model) {
     && (process.env.OPENCODE_FREE_TIER_REQUEST_CONTRACT || "").trim().toLowerCase() !== "off";
 }
 
-export function configuredPlaceholderToolNames() {
+function parseToolNames(value) {
   const kept = [];
-  for (const part of (process.env.OPENCODE_FREE_TIER_PLACEHOLDER_TOOLS || "").split(",")) {
+  for (const part of (value || "").split(",")) {
     const name = part.trim();
     if (kept.length >= 32) break;
     if (!NAME_PATTERN.test(name)) continue;
@@ -51,8 +55,31 @@ export function configuredPlaceholderToolNames() {
   return kept;
 }
 
+export function configuredPlaceholderToolNames() {
+  return parseToolNames(process.env.OPENCODE_FREE_TIER_PLACEHOLDER_TOOLS || "");
+}
+
+export function recoveryToolNames() {
+  const configured = parseToolNames(process.env.OPENCODE_FREE_TIER_RECOVERY_TOOLS || "");
+  return configured.length > 0 ? configured : [...DEFAULT_RECOVERY_TOOL_NAMES];
+}
+
 function hasTools(body) {
   return Array.isArray(body.tools) && body.tools.length > 0;
+}
+
+function buildTools(names, requestFormat) {
+  if (requestFormat === "openai-responses") {
+    return names.map((name) => ({
+      type: "function", name,
+      description: PLACEHOLDER_TOOL_DESCRIPTION,
+      parameters: PLACEHOLDER_TOOL_PARAMETERS,
+    }));
+  }
+  return names.map((name) => ({
+    type: "function",
+    function: { name, description: PLACEHOLDER_TOOL_DESCRIPTION, parameters: PLACEHOLDER_TOOL_PARAMETERS },
+  }));
 }
 
 export function applyFreeTierRequestContract(body, requestFormat, placeholderNames = [PLACEHOLDER_TOOL_NAME]) {
@@ -60,23 +87,21 @@ export function applyFreeTierRequestContract(body, requestFormat, placeholderNam
   const next = { ...body, stream: true };
   if (hasTools(next)) return next;
   const names = placeholderNames.length > 0 ? placeholderNames : [PLACEHOLDER_TOOL_NAME];
-  if (requestFormat === "openai-responses") {
-    next.tools = names.map((name) => ({
-      type: "function",
-      name,
-      description: PLACEHOLDER_TOOL_DESCRIPTION,
-      parameters: PLACEHOLDER_TOOL_PARAMETERS,
-    }));
-  } else if (requestFormat === "openai" || requestFormat === null) {
-    next.tools = names.map((name) => ({
-      type: "function",
-      function: {
-        name,
-        description: PLACEHOLDER_TOOL_DESCRIPTION,
-        parameters: PLACEHOLDER_TOOL_PARAMETERS,
-      },
-    }));
+  if (requestFormat === "openai-responses" || requestFormat === "openai" || requestFormat === null) {
+    next.tools = buildTools(names, requestFormat);
   }
+  return next;
+}
+
+export function applyFreeTierRecoveryContract(body, requestFormat) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const next = { ...body, stream: true };
+  const callerTools = hasTools(next)
+    ? next.tools.filter((tool) => clientToolNamesOf({ tools: [tool] })[0] !== PLACEHOLDER_TOOL_NAME)
+    : [];
+  const callerNames = new Set(clientToolNamesOf({ tools: callerTools }));
+  const recoveryNames = recoveryToolNames().filter((name) => !callerNames.has(name));
+  next.tools = [...callerTools, ...buildTools(recoveryNames, requestFormat)];
   return next;
 }
 

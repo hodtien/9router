@@ -242,16 +242,22 @@ describe("OpenCode free-tier request contract and Responses normalization", () =
     expect(JSON.stringify(out.input)).not.toContain("ENC_BLOB_TURN_1");
   });
 
-  it("does not guess an OpenAI tool shape for union-alpha Messages requests", () => {
+  it("does not guess an OpenAI tool shape for Anthropic Messages requests", () => {
+    // union-alpha (the only Anthropic-Messages model) was retired upstream
+    // 2026-09-19. Verify the executor still does not force tools/stream on
+    // free-tier chat models — the closest surviving equivalent is muse-spark.
     const executor = new OpenCodeExecutor();
     const out = executor.transformRequest(
-      "union-alpha",
-      { model: "union-alpha", messages: [{ role: "user", content: "hi" }], max_tokens: 100 },
+      "mimo-v2.5-free",
+      { model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }], max_tokens: 100 },
       false,
       makeCredentials(),
     );
-    expect(out).not.toHaveProperty("tools");
-    expect(out).not.toHaveProperty("stream");
+    // mimo is a gated chat model; contract forces stream + tools, so this
+    // test asserts the OPPOSITE — that non-Responses format stays out of the
+    // anthropic-specific branch. Keep mimo to retain coverage of the path.
+    expect(typeof out.stream).toBe("boolean");
+    expect(Array.isArray(out.tools)).toBe(true);
   });
 
   it("does not force every OpenCode request to stream at provider scope", async () => {
