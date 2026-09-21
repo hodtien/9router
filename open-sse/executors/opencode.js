@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
+import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
@@ -27,6 +28,39 @@ const CONTRACT_SESSION_FIELD = "_opencodeContractSession";
 const CONTRACT_ATTEMPT_FIELD = "_opencodeContractAttempt";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const OPENCODE_REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const REQ_FIELD = "_opencodeRequest";
+const OPENCODE_DECOY_RESPONSES_TOOLS = [
+  { type: "function", name: "bash", description: "This tool is currently unavailable and must not be used.", parameters: { type: "object", properties: {} } },
+  { type: "function", name: "read", description: "This tool is currently unavailable and must not be used.", parameters: { type: "object", properties: {} } },
+];
+const OPENCODE_DECOY_CHAT_TOOLS = OPENCODE_DECOY_RESPONSES_TOOLS.map((tool) => ({
+  type: "function",
+  function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+}));
+
+function cloakOpencodeTools(body, isResponses) {
+  if (!body || typeof body !== "object") return;
+  if (isResponses) {
+    if (!Array.isArray(body.tools)) body.tools = [];
+    const names = new Set(body.tools.map((tool) => tool.name || tool.function?.name));
+    for (const tool of OPENCODE_DECOY_RESPONSES_TOOLS) {
+      if (!names.has(tool.name)) body.tools.push({ ...tool, parameters: { ...tool.parameters } });
+    }
+    if (!body.tool_choice) body.tool_choice = "auto";
+    return;
+  }
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
+    body.tools = OPENCODE_DECOY_CHAT_TOOLS.map((tool) => ({ ...tool, function: { ...tool.function, parameters: { ...tool.function.parameters } } }));
+    if (!body.tool_choice) body.tool_choice = "none";
+    return;
+  }
+  const names = new Set(body.tools.map((tool) => tool.function?.name || tool.name));
+  for (const tool of OPENCODE_DECOY_CHAT_TOOLS) {
+    if (!names.has(tool.function.name)) body.tools.push({ ...tool, function: { ...tool.function, parameters: { ...tool.function.parameters } } });
+  }
+}
+
 function hasValidOpencodeVersion(ua) {
   const m = String(ua || "").match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
   if (!m) return false;
@@ -134,6 +168,53 @@ function nativeSession(headers) {
   return session && OPENCODE_SESSION_RE.test(session) ? session : null;
 }
 
+const stableOpencodeSessions = new Map();
+const MAX_STABLE_SESSIONS = 1000;
+const stableSessionCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of stableOpencodeSessions) {
+    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) stableOpencodeSessions.delete(key);
+  }
+}, MEMORY_CONFIG.sessionCleanupIntervalMs);
+if (stableSessionCleanup.unref) stableSessionCleanup.unref();
+
+function identityKey(credentials) {
+  const connectionId = credentials?.connectionId || credentials?.id;
+  if (connectionId) return `opencode:conn:${String(connectionId).slice(0, 128)}`;
+  const raw = credentials?.rawHeaders || {};
+  const auth = raw.authorization || raw.Authorization || raw["x-api-key"] || raw["X-Api-Key"] || "";
+  if (auth) return `opencode:auth:${crypto.createHash("sha256").update(String(auth)).digest("hex").slice(0, 32)}`;
+  return "opencode:default";
+}
+
+export function stableSessionId(credentials) {
+  const key = identityKey(credentials);
+  const existing = stableOpencodeSessions.get(key);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    stableOpencodeSessions.delete(key);
+    stableOpencodeSessions.set(key, existing);
+    return existing.sessionId;
+  }
+  const sessionId = generateSessionId();
+  if (stableOpencodeSessions.size >= MAX_STABLE_SESSIONS) stableOpencodeSessions.delete(stableOpencodeSessions.keys().next().value);
+  stableOpencodeSessions.set(key, { sessionId, lastUsed: Date.now() });
+  return sessionId;
+}
+
+function normalizeRequestId(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return OPENCODE_REQUEST_RE.test(normalized) ? normalized : null;
+}
+
+function resolveOpencodeRequestId(body, credentials, sessionId) {
+  const raw = credentials?.rawHeaders || {};
+  const downstream = normalizeRequestId(raw["x-opencode-request"] || raw["X-OpenCode-Request"]);
+  if (downstream) return downstream;
+  return generateRequestId();
+}
+
 // Strip the thinking suffix "model(level)" so registry lookups hit the base id.
 function baseModelId(model) {
   return String(model || "").replace(/\([^()]+\)\s*$/, "").trim();
@@ -167,14 +248,13 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     }
   }
 
-  const resolved = incoming || normalizeSession(providerSessionId) || resolveSessionId({
-    headers,
-    body,
-    connectionId: credentials?.connectionId,
-    scope: "opencode",
-  });
-
-  return resolved ? translateSessionId(resolved, clientTool) : generateSessionId();
+  const hinted = incoming || normalizeSession(providerSessionId);
+  if (hinted) return translateSessionId(hinted, clientTool);
+  if (credentials?.connectionId || body?.session_id || body?.conversation_id || body?.prompt_cache_key) {
+    const resolved = resolveSessionId({ headers, body, connectionId: credentials?.connectionId, scope: "opencode" });
+    if (resolved) return translateSessionId(resolved, clientTool);
+  }
+  return stableSessionId(credentials);
 }
 
 function sanitizeResponsesItems(body) {
@@ -246,6 +326,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       ...sourceCredentials,
       [SESSION_FIELD]: resolved,
+      [REQ_FIELD]: resolveOpencodeRequestId(body, sourceCredentials, resolved),
       [CONTRACT_SESSION_FIELD]: clientSuppliedSession(sourceCredentials.rawHeaders) || undefined,
     };
   }
@@ -271,8 +352,12 @@ export class OpenCodeExecutor extends BaseExecutor {
       delete body.max_tokens;
       delete body.max_completion_tokens;
       normalizeOpencodeReasoning(model, body);
+      body.stream = true;
       body.store = false;
       sanitizeResponsesItems(body);
+      if (!Array.isArray(body.tools) || body.tools.length === 0) cloakOpencodeTools(body, true);
+    } else if (body && typeof body === "object") {
+      cloakOpencodeTools(body, false);
     } else if (isAnthropicMessagesModel(model) && body && typeof body === "object") {
       requestFormat = "anthropic-messages";
       delete body.max_output_tokens;
@@ -329,12 +414,13 @@ export class OpenCodeExecutor extends BaseExecutor {
       ...(userAgent ? { "User-Agent": userAgent } : {}),
       ...(client ? { "x-opencode-client": client } : {}),
       "x-opencode-session": prepared,
-      "x-opencode-request": lower["x-opencode-request"] || generateRequestId(),
+      "x-opencode-request": credentials?.[REQ_FIELD] || normalizeRequestId(lower["x-opencode-request"]) || generateRequestId(),
       ...(project ? { "x-opencode-project": project } : {}),
       "Accept": stream || gated ? "text/event-stream" : "*/*",
       "Accept-Language": lower["accept-language"] || "*",
       "sec-fetch-mode": lower["sec-fetch-mode"] || "cors",
       "Accept-Encoding": lower["accept-encoding"] || "br, gzip, deflate",
+      ...(url?.endsWith("/messages") ? { "anthropic-version": "2023-06-01" } : {}),
     };
   }
 
