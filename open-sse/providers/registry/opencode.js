@@ -17,6 +17,10 @@ export default {
     headers: {
       "x-opencode-client": "desktop",
     },
+    forceStream: true,
+    quirks: {
+      forceAutoToolChoiceModels: ["muse-spark-1.3-contributor-free"],
+    },
     noAuth: true,
   },
   models: [
@@ -24,9 +28,6 @@ export default {
     // /chat/completions, so the format is declared per-model, not per-provider.
     { id: "muse-spark-1.2-contributor-free", name: "Muse Spark 1.2 Contributor Free", targetFormat: "openai-responses" },
     { id: "muse-spark-1.3-contributor-free", name: "Muse Spark 1.3 Contributor Free", targetFormat: "openai-responses" },
-    // ponytail: union-alpha lives on /zen/v1/messages (Anthropic Messages
-    // protocol). Same Bearer-public free gate, same session header shape.
-    { id: "union-alpha", name: "Union Alpha Free", targetFormat: "claude" },
   ],
   modelsFetcher: { url: "https://opencode.ai/zen/v1/models", type: "opencode-free" },
   passthroughModels: true,

@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
+vi.mock("../../open-sse/utils/proxyFetch.js", () => ({ proxyAwareFetch: fetchMock }));
+
 import {
   OPENCODE_SESSION_RE,
   generateSessionId,
@@ -212,6 +216,39 @@ describe("OpenCode free-tier request contract and Responses normalization", () =
     expect(out.tools).toEqual([tool]);
   });
 
+  it("keeps the free-tier contract for thinking-suffixed models", () => {
+    const out = new OpenCodeExecutor().transformRequest(
+      "mimo-v2.5-free(high)",
+      { messages: [{ role: "user", content: "hi" }] },
+      true,
+      makeCredentials(),
+    );
+    expect(out.tools.map((tool) => tool.function?.name)).toEqual(["_noop"]);
+  });
+
+  it("passes configured proxy options to the native transport", async () => {
+    const { proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js");
+    proxyAwareFetch.mockClear();
+    proxyAwareFetch.mockResolvedValueOnce(new Response("{}", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    const proxyOptions = {
+      connectionProxyEnabled: true,
+      connectionProxyUrl: "http://proxy.invalid:8080",
+      connectionNoProxy: "",
+      vercelRelayUrl: "https://relay.invalid/relay",
+    };
+    await new OpenCodeExecutor().execute({
+      model: "big-pickle",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials: makeCredentials(),
+      proxyOptions,
+    });
+    expect(proxyAwareFetch.mock.calls[0][2]).toBe(proxyOptions);
+  });
+
   it("uses the flat placeholder shape for gated Responses requests", () => {
     const executor = new OpenCodeExecutor();
     const out = executor.transformRequest(
@@ -242,20 +279,8 @@ describe("OpenCode free-tier request contract and Responses normalization", () =
     expect(JSON.stringify(out.input)).not.toContain("ENC_BLOB_TURN_1");
   });
 
-  it("does not guess an OpenAI tool shape for union-alpha Messages requests", () => {
-    const executor = new OpenCodeExecutor();
-    const out = executor.transformRequest(
-      "union-alpha",
-      { model: "union-alpha", messages: [{ role: "user", content: "hi" }], max_tokens: 100 },
-      false,
-      makeCredentials(),
-    );
-    expect(out).not.toHaveProperty("tools");
-    expect(out).not.toHaveProperty("stream");
-  });
-
-  it("does not force every OpenCode request to stream at provider scope", async () => {
+  it("declares provider streaming for free-tier SSE aggregation", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS.opencode?.forceStream).not.toBe(true);
+    expect(PROVIDERS.opencode?.forceStream).toBe(true);
   });
 });

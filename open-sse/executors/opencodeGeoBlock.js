@@ -39,6 +39,18 @@ export function isOpencodeFreeTierRefusal(status, bodyText) {
   return FREE_TIER_SIGNALS.some((signal) => lower.includes(signal));
 }
 
+export function isOpencodeFreeTierRateLimitForProvider(provider, status, bodyText) {
+  if (!String(provider || "").toLowerCase().startsWith("opencode")) return false;
+  if (Number(status) !== 429) return false;
+  try {
+    const parsed = typeof bodyText === "string" ? JSON.parse(bodyText) : bodyText;
+    const type = parsed?.type || parsed?.error?.type;
+    return type === "FreeUsageLimitError" || type === "FreeTierError";
+  } catch {
+    return /FreeUsageLimitError|FreeTierError/i.test(String(bodyText || ""));
+  }
+}
+
 export function isOpencodeFreeTierRefusalForProvider(provider, status, bodyText) {
   return String(provider || "").toLowerCase().startsWith("opencode")
     && isOpencodeFreeTierRefusal(status, bodyText);
