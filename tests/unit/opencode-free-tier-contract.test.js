@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   applyFreeTierRequestContract,
+  applyFreeTierRecoveryContract,
   configuredPlaceholderToolNames,
+  recoveryToolNames,
   noteFreeTierOutcome,
   prepareFreeTierRequest,
   rebuildJsonFromForcedStream,
@@ -38,6 +40,20 @@ describe("OpenCode free-tier request contract", () => {
     expect(requiresFreeTierRequestContract("zen", "opencode", "mimo-v2.5-free")).toBe(false);
   });
 
+  it("uses the bounded CLI recovery pack without executable payloads", () => {
+    expect(recoveryToolNames()).toEqual(["bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "websearch", "write"]);
+    const out = applyFreeTierRecoveryContract(chatBody(), "openai");
+    expect(out.stream).toBe(true);
+    expect(out.tools.map((tool) => tool.function.name)).toEqual(recoveryToolNames());
+    expect(out.tools.every((tool) => Object.keys(tool.function).sort().join(",") === "description,name,parameters")).toBe(true);
+  });
+
+  it("validates configured recovery names and caps them", () => {
+    process.env.OPENCODE_FREE_TIER_RECOVERY_TOOLS = ["bash", "bad.dot", "bash", ...Array.from({ length: 40 }, (_, i) => `tool_${i}`)].join(",");
+    expect(recoveryToolNames()).toHaveLength(32);
+    expect(recoveryToolNames().slice(0, 2)).toEqual(["bash", "tool_0"]);
+  });
+
   it("uses one _noop placeholder for chat when no names are known", () => {
     const out = applyFreeTierRequestContract(chatBody(), "openai", []);
     expect(out.stream).toBe(true);
@@ -50,6 +66,19 @@ describe("OpenCode free-tier request contract", () => {
     const out = applyFreeTierRequestContract({ ...chatBody(), tools: [tool] }, "openai", ["borrowed"]);
     expect(out.tools).toEqual([tool]);
     expect(out.tools[0]).toBe(tool);
+  });
+
+  it("appends recovery tools after caller tools while preserving caller entries", () => {
+    const tool = { type: "function", name: "client_tool", parameters: { type: "object", properties: {} } };
+    const out = applyFreeTierRecoveryContract({ ...chatBody(), tools: [tool] }, "openai-responses");
+    expect(out.tools[0]).toBe(tool);
+    expect(out.tools.slice(1).map((entry) => entry.name)).toEqual(recoveryToolNames());
+  });
+
+  it("deduplicates recovery names already supplied by the caller", () => {
+    const tool = { type: "function", name: "bash", parameters: { type: "object", properties: {} } };
+    const out = applyFreeTierRecoveryContract({ ...chatBody(), tools: [tool] }, "openai-responses");
+    expect(out.tools.filter((entry) => entry.name === "bash")).toHaveLength(1);
   });
 
   it("uses flat tools for Responses and never guesses an Anthropic tool shape", () => {
@@ -146,17 +175,59 @@ describe("OpenCode free-tier request contract", () => {
     expect(out.tool_choice).toBe(choice);
   });
 
-  it("routes union-alpha through the registered Claude translator", () => {
+  it("routes union-alpha through the registered Claude Messages transport", () => {
+    const executor = new OpenCodeExecutor();
     const target = getModelTargetFormat("oc", "union-alpha");
-    const translated = translateRequest(FORMATS.OPENAI, target, "union-alpha", {
-      messages: [{ role: "system", content: "be concise" }, { role: "user", content: "hi" }],
-      tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }],
-    }, true, {}, "opencode");
-    const out = new OpenCodeExecutor().transformRequest("union-alpha", translated, true, {});
+    const translated = translateRequest(
+      FORMATS.OPENAI,
+      target,
+      "union-alpha",
+      {
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }],
+      },
+      true,
+      {},
+      "opencode",
+    );
+    const out = executor.transformRequest("union-alpha", translated, true, {});
+
     expect(target).toBe(FORMATS.CLAUDE);
+    expect(executor.buildUrl("union-alpha")).toBe("https://opencode.ai/zen/v1/messages");
+    expect(executor.buildHeaders({}, true, "https://opencode.ai/zen/v1/messages", "union-alpha")["anthropic-version"]).toBe("2023-06-01");
     expect(out.tools[0]).toMatchObject({ name: "lookup", input_schema: { type: "object" } });
     expect(out.tools[0]).not.toHaveProperty("function");
-    expect(out.messages.every((message) => message.role !== "system")).toBe(true);
+    expect(out.messages[0]).toMatchObject({ role: "user", content: [{ type: "text", text: "hi" }] });
+    expect(out.stream).toBe(true);
+  });
+
+  it("uses JSON transport headers for a paid non-streaming request", () => {
+    const executor = new OpenCodeExecutor();
+    const headers = executor.buildHeaders(
+      {},
+      false,
+      "https://opencode.ai/zen/v1/chat/completions",
+      "paid-model",
+    );
+
+    expect(headers.Accept).toBe("*/*");
+  });
+
+  it("does not force stream or inject tools for paid OpenCode models", () => {
+    const out = new OpenCodeExecutor().transformRequest(
+      "paid-model",
+      { model: "paid-model", messages: [{ role: "user", content: "hi" }] },
+      false,
+      { _opencodeContractSession: "session-a" },
+    );
+
+    expect(out.stream).toBe(false);
+    expect(out).not.toHaveProperty("tools");
+  });
+
+  it("does not declare provider-wide streaming", async () => {
+    const { PROVIDERS } = await import("../../open-sse/config/providers.js");
+    expect(PROVIDERS.opencode?.forceStream).toBeUndefined();
   });
 
   it("preserves the complete Responses terminal payload", async () => {

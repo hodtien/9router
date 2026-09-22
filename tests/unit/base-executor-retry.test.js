@@ -35,6 +35,27 @@ describe("BaseExecutor.execute — retry by status (config-driven)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("passes strict connection proxy options to the fetch layer", async () => {
+    const ex = makeExec({ baseUrl: "https://x/api" });
+    const proxyOptions = {
+      connectionProxyEnabled: true,
+      connectionProxyUrl: "http://proxy.internal:8900",
+      connectionNoProxy: "",
+      strictProxy: true,
+    };
+    fetchMock.mockResolvedValue(res(200));
+
+    await ex.execute({
+      model: "m",
+      body: {},
+      stream: false,
+      credentials: creds,
+      proxyOptions,
+    });
+
+    expect(fetchMock.mock.calls[0][2]).toEqual(proxyOptions);
+  });
+
   it("stops after exhausting 502 attempts on a single url and throws", async () => {
     const ex = makeExec({ baseUrl: "https://x/api", retry: { 502: { attempts: 2, delayMs: 0 } } });
     fetchMock.mockResolvedValue(res(502));
