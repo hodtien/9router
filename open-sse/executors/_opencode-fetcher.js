@@ -28,7 +28,7 @@ for await (const chunk of Bun.stdin.stream()) {
   chunks.push(chunk);
 }
 const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-const { url, headers = {}, body = "", stream = false, proxyUrl, vercelRelayUrl } = input;
+const { url, headers = {}, body = "", stream = false, proxyUrl, strictProxy = false, vercelRelayUrl } = input;
 
 const relayTarget = vercelRelayUrl ? new URL(url) : null;
 const requestUrl = vercelRelayUrl || url;
@@ -53,6 +53,10 @@ if (proxyUrl && !vercelRelayUrl) {
   // Confirmed working with the Xoay / VN00 pool format:
   //   http://user:pass@host:port
   requestInit.proxy = proxyUrl;
+}
+
+if (strictProxy && !proxyUrl && !vercelRelayUrl) {
+  throw new Error("OpenCode proxy is required but no proxy URL was provided");
 }
 
 if (stream) {

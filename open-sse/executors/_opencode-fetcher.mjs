@@ -23,19 +23,27 @@
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
 const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-const { url, headers = {}, body = "", stream = false, proxyUrl } = input;
+const { url, headers = {}, body = "", stream = false, proxyUrl, strictProxy = false } = input;
 
 const finalHeaders = { ...headers };
 if (!finalHeaders["User-Agent"] && !finalHeaders["user-agent"]) {
   finalHeaders["user-agent"] = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14";
 }
 
-// ponytail: Node fetch honors HTTPS_PROXY automatically. Setting it before
-// the fetch call is enough — no dispatcher plumbing. The Next standalone
-// build strips undici, so we can't use ProxyAgent directly.
+// ponytail: Node's fetch honors HTTPS_PROXY/HTTP_PROXY only on Node >= 24; on
+// 18/20/22 undici ignores them, so a proxyUrl here would silently egress
+// direct. Strict-proxy traffic must therefore never reach this child — the
+// Bun executor rejects on non-zero exit before spawning it (see opencode.js
+// `strictProxy` close-handler guard). This fallback path is for the non-strict
+// case, where direct egress is acceptable. The Next standalone build strips
+// undici, so we can't use ProxyAgent directly.
 if (proxyUrl) {
   process.env.HTTPS_PROXY = proxyUrl;
   process.env.HTTP_PROXY = proxyUrl;
+}
+
+if (strictProxy && !proxyUrl) {
+  throw new Error("OpenCode proxy is required but no proxy URL was provided");
 }
 
 if (stream) {

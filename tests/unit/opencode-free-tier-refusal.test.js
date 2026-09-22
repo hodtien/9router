@@ -3,6 +3,8 @@ import { beforeEach, describe, it, expect, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   getProviderConnections: vi.fn(),
   updateProviderConnection: vi.fn(),
+  getSettings: vi.fn(),
+  resolveConnectionProxyConfig: vi.fn(),
 }));
 
 // ponytail: auth.js pulls in a heavy DB+network chain on import. The predicate
@@ -12,11 +14,11 @@ vi.mock("@/lib/localDb", () => ({
   getProviderConnections: mocks.getProviderConnections,
   validateApiKey: vi.fn(),
   updateProviderConnection: mocks.updateProviderConnection,
-  getSettings: vi.fn(),
+  getSettings: mocks.getSettings,
   getProxyPools: vi.fn(),
 }));
 vi.mock("@/lib/network/connectionProxy", () => ({
-  resolveConnectionProxyConfig: vi.fn(),
+  resolveConnectionProxyConfig: mocks.resolveConnectionProxyConfig,
   pickProxyPoolId: vi.fn(),
 }));
 vi.mock("open-sse/services/accountFallback.js", () => ({
@@ -110,5 +112,28 @@ describe("isOpencodeFreeTierRefusal (PR #14011)", () => {
     expect(result).toEqual({ shouldFallback: false, cooldownMs: 0 });
     expect(mocks.getProviderConnections).not.toHaveBeenCalled();
     expect(mocks.updateProviderConnection).not.toHaveBeenCalled();
+  });
+
+  it("preserves strictProxy on stored provider credentials", async () => {
+    mocks.getProviderConnections.mockResolvedValue([{
+      id: "connection-1",
+      provider: "opencode",
+      providerSpecificData: { proxyPoolId: "pool-1" },
+      testStatus: "active",
+    }]);
+    mocks.getSettings.mockResolvedValue({ providerStrategies: {}, fallbackStrategy: "fill-first" });
+    mocks.resolveConnectionProxyConfig.mockResolvedValue({
+      proxyPoolId: "pool-1",
+      connectionProxyEnabled: true,
+      connectionProxyUrl: "http://proxy.internal:8900",
+      connectionNoProxy: "",
+      strictProxy: true,
+      vercelRelayUrl: "",
+    });
+
+    const { getProviderCredentials } = await import("../../src/sse/services/auth.js");
+    const credentials = await getProviderCredentials("opencode");
+
+    expect(credentials.providerSpecificData.strictProxy).toBe(true);
   });
 });

@@ -7,6 +7,7 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
+import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -79,6 +80,7 @@ const RESPONSES_MODELS = new Set([
   "muse-spark-1.2-contributor-free",
   "muse-spark-1.3-contributor-free",
 ]);
+const ANTHROPIC_MESSAGES_MODELS = new Set(["union-alpha"]);
 // ponytail: replicate opencode's canonical `descending()` from
 // packages/schema/src/identifier.ts. First 12 hex chars come from a per-ms
 // counter (not a hardcoded +1), so two requests landing in the same millisecond
@@ -222,6 +224,10 @@ function baseModelId(model) {
 function isResponsesModel(model) {
   const base = baseModelId(model);
   return RESPONSES_MODELS.has(base) || isMuseSparkModel(base);
+}
+
+function isAnthropicMessagesModel(model) {
+  return ANTHROPIC_MESSAGES_MODELS.has(baseModelId(model));
 }
 
 function requestFingerprint(body) {
@@ -415,7 +421,7 @@ export class OpenCodeExecutor extends BaseExecutor {
 
   transformRequest(model, body, stream, credentials) {
     if (body && typeof body === "object" && model && !body.model) body.model = model;
-    let requestFormat = "openai";
+    let requestFormat = isAnthropicMessagesModel(model) ? "claude" : "openai";
     if (isResponsesModel(model || body?.model) && body && typeof body === "object") {
       requestFormat = "openai-responses";
       const realRequestCredentials = credentials?.connectionId || credentials?.rawHeaders;
@@ -436,12 +442,12 @@ export class OpenCodeExecutor extends BaseExecutor {
       delete body.max_tokens;
       delete body.max_completion_tokens;
       normalizeOpencodeReasoning(model, body);
-      body.stream = true;
+      body.stream = !!stream;
       body.store = false;
       normalizeResponsesTools(body);
       sanitizeResponsesItems(body);
     } else if (body && typeof body === "object") {
-      body.stream = true;
+      body.stream = !!stream;
     }
 
     const transformedBody = injectReasoningContent({ provider: this.provider, model, body });
@@ -462,6 +468,7 @@ export class OpenCodeExecutor extends BaseExecutor {
   buildUrl(model) {
     const base = this.config.baseUrl;
     if (isResponsesModel(model)) return `${base}/zen/v1/responses`;
+    if (isAnthropicMessagesModel(model)) return `${base}/zen/v1/messages`;
     return `${base}/zen/v1/chat/completions`;
   }
 
@@ -496,7 +503,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       "Accept-Language": lower["accept-language"] || "*",
       "sec-fetch-mode": lower["sec-fetch-mode"] || "cors",
       "Accept-Encoding": lower["accept-encoding"] || "br, gzip, deflate",
-      ...(url?.endsWith("/messages") ? { "anthropic-version": "2023-06-01" } : {}),
+      ...(url?.endsWith("/messages") ? { "anthropic-version": ANTHROPIC_API_VERSION } : {}),
     };
   }
 
@@ -542,7 +549,10 @@ export class OpenCodeExecutor extends BaseExecutor {
       credentials: retryCredentials,
       _opencodeRecoveryAttempt: true,
     }).catch(() => null);
-    if (retry?.response?.ok) return retry;
+    if (retry?.response?.ok) {
+      noteFreeTierOutcome(first.contractAttempt, true);
+      return retry;
+    }
     return { ...first, response: new Response(refusalBody, { status: first.response.status, headers: first.response.headers }) };
   }
 
@@ -555,6 +565,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     const headers = this.buildHeaders(preparedCredentials, upstreamStream, url, model);
     const attempt = preparedCredentials[CONTRACT_ATTEMPT_FIELD];
     const finalize = (result) => {
+      result.contractAttempt = attempt;
       if (!_opencodeRecoveryAttempt) noteFreeTierOutcome(attempt, result.response.ok);
       if (clientRequestedStream || !attempt) return result;
       const response = rebuildJsonFromForcedStream(
@@ -594,12 +605,17 @@ export class OpenCodeExecutor extends BaseExecutor {
       throw new Error(`opencode Bun fetcher: script not found. Tried: ${candidates.join(", ")}. Set OPENCODE_FETCHER_PATH or copy _opencode-fetcher.js into cli/app.`);
     }
 
+    // Hoisted so the child-process `close` handlers below can read it: `input`
+    // is the JSON *string* written to stdin, so `input.strictProxy` is always
+    // undefined and a guard on it would be dead code.
+    const strictProxy = proxyOptions?.strictProxy === true;
     const input = JSON.stringify({
       url,
       headers,
       body: JSON.stringify(transformedBody),
       stream: upstreamStream,
       proxyUrl: proxyOptions?.connectionProxyEnabled ? proxyOptions.connectionProxyUrl : "",
+      strictProxy,
       vercelRelayUrl: proxyOptions?.vercelRelayUrl || "",
     });
 
@@ -712,7 +728,11 @@ export class OpenCodeExecutor extends BaseExecutor {
         // TLS — different ClientHello signature from Bun, so the upstream
         // free-tier gate rate-limits them as separate buckets. When Bun is
         // burned (FreeUsageLimitError), Node often still works through a
-        // different code path on the same IP.
+        // different code path on the same IP. A strict proxy request must not
+        // take this fallback because the Node child cannot guarantee proxy use.
+        if (strictProxy) {
+          return reject(new Error(`opencode Bun fetcher exit=${code} with strict proxy enabled`));
+        }
         return tryNodeFallback({ resolve: (result) => resolve(finalize(result)), reject, input, url, headers, transformedBody, bunCode: code, bunStderr: stderr });
       });
     });

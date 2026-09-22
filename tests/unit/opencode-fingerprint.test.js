@@ -279,8 +279,27 @@ describe("OpenCode free-tier request contract and Responses normalization", () =
     expect(JSON.stringify(out.input)).not.toContain("ENC_BLOB_TURN_1");
   });
 
-  it("declares provider streaming for free-tier SSE aggregation", async () => {
+  it("keeps streaming scoped to the gated free-tier model", () => {
+    const executor = new OpenCodeExecutor();
+    const free = executor.transformRequest(
+      "mimo-v2.5-free",
+      { messages: [{ role: "user", content: "hi" }] },
+      false,
+      makeCredentials(),
+    );
+    const paid = executor.transformRequest(
+      "paid-model",
+      { messages: [{ role: "user", content: "hi" }] },
+      false,
+      makeCredentials(),
+    );
+
+    expect(free.stream).toBe(true);
+    expect(paid.stream).toBe(false);
+  });
+
+  it("does not declare provider-wide streaming", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS.opencode?.forceStream).toBe(true);
+    expect(PROVIDERS.opencode?.forceStream).toBeUndefined();
   });
 });

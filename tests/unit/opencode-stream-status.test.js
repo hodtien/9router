@@ -138,6 +138,36 @@ describe("OpenCode streaming transport status", () => {
     expect(await result.response.text()).toBe("data: hello\n\n");
   });
 
+  it("rejects instead of Node-falling-back when Bun exits non-zero under strict proxy", async () => {
+    // A premium (non-gated) model with stream:false keeps upstreamStream false,
+    // so a non-zero Bun exit reaches the tryNodeFallback branch — the only path
+    // where the strict-proxy guard against direct egress matters.
+    let spawns = 0;
+    mocks.spawn.mockImplementation(() => {
+      spawns += 1;
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stdin = { end: vi.fn(() => queueMicrotask(() => child.emit("close", 1))) };
+      return child;
+    });
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+    process.env.OPENCODE_NODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.mjs", import.meta.url).pathname;
+
+    await expect(new OpenCodeExecutor().execute({
+      model: "gpt-5",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: false,
+      credentials: {},
+      proxyOptions: {
+        connectionProxyEnabled: true,
+        connectionProxyUrl: "http://proxy.internal:8900",
+        strictProxy: true,
+      },
+    })).rejects.toThrow(/strict proxy/i);
+    expect(spawns).toBe(1);
+  });
+
   it("retries a borrowed placeholder refusal once with the CLI recovery pack", async () => {
     const inputs = [];
     const refusal = JSON.stringify({ type: "FreeTierError", message: "free tier can only be used within OpenCode" });
@@ -273,6 +303,7 @@ describe("OpenCode streaming transport status", () => {
     expect(retryTools[0]).toEqual(tool);
     expect(retryTools.slice(1).map((entry) => entry.name)).toEqual(recoveryToolNames());
     expect(await result.response.text()).toBe("data: ok\\n\\n");
+    expect(getObservedToolNames("opencode", "muse-spark-1.3-contributor-free")).toEqual(["lookup"]);
   });
 
   it("preserves non-streaming refusals without a second transport attempt", async () => {
@@ -288,6 +319,10 @@ describe("OpenCode streaming transport status", () => {
     expect(result.response.status).toBe(403);
     expect(await result.response.text()).toBe(refusal);
     expect(mocks.spawn).toHaveBeenCalledTimes(1);
+    expect(inputs[0].stream).toBe(false);
+    expect(inputs[0].headers.Accept).toBe("*/*");
+    expect(JSON.parse(inputs[0].body)).toMatchObject({ stream: false });
+    expect(JSON.parse(inputs[0].body)).not.toHaveProperty("tools");
   });
 
   it("learns caller names and borrows the session list without learning placeholders", async () => {
