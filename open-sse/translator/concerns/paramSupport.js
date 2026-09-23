@@ -38,6 +38,18 @@ const STRIP_RULES = [
     match: /(^|\/)fugu(-ultra)?(-[0-9]+)?$/i,
     dropReasoningObjectUnless: { field: "reasoning", allow: ["high", "xhigh", "max"] },
   },
+  // MiMo Desktop Preview models (account-service route): content must be plain string,
+  // rejects OpenAI content-part array. Cloud models keep their parts (mimo-v2-omni is multi-modal).
+  { provider: "xiaomi-mimo", match: /preview/i, flattenContent: true },
+  // Strict OpenAI-compatible validators reject unknown assistant-message fields.
+  // Clients that talk to reasoning models (e.g. Hermes) echo the prior turn's
+  // reasoning back on every assistant message; Groq answers 400 and Mistral 422
+  // ("extra_forbidden") on it, which knocks these providers out of every
+  // multi-turn combo. Providers that *require* the field (DeepSeek, Kimi) are
+  // handled by reasoningContentInjector and are not listed here.
+  { provider: "groq", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
+  { provider: "mistral", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
+  { provider: "cerebras", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
 ];
 
 // Enforce minimum values for params (e.g. max_tokens floor).
@@ -105,6 +117,15 @@ export function stripUnsupportedParams(provider, model, body) {
       const obj = body[field];
       if (obj && typeof obj === "object" && !allow.includes(obj.effort)) {
         delete body[field];
+      }
+    }
+    // Per-message field drop (assistant turns only — that is where clients replay reasoning).
+    if (Array.isArray(rule.dropMessageFields) && Array.isArray(body.messages)) {
+      for (const msg of body.messages) {
+        if (!msg || msg.role !== "assistant") continue;
+        for (const key of rule.dropMessageFields) {
+          if (msg[key] !== undefined) delete msg[key];
+        }
       }
     }
     // CF Workers AI oneOf root schema only accepts content as plain string (#1926)
