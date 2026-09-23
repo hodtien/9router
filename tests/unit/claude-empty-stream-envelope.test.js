@@ -80,9 +80,6 @@ describe("createSSEStream empty-claude envelope", () => {
   });
 
   it("synthesizes message_stop when upstream emits message_start but never closes", async () => {
-    // Partial stream: upstream sent message_start + a few content blocks then
-    // abruptly closed (client abort, network drop, upstream cancel). Without the
-    // synthesis guard, Claude clients error "stream ended before message_stop".
     const stream = createSSEStream({
       mode: "translate",
       targetFormat: "openai",
@@ -99,14 +96,10 @@ describe("createSSEStream empty-claude envelope", () => {
       'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
       "event: content_block_delta\n",
       'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
-      // NO message_stop — upstream was cut off
     ].join("");
     const text = await collect(stream, [partial]);
-    // Real content blocks flowed through…
     expect(text).toContain("event: message_start");
-    // …and the guard synthesized the terminal so the client sees a clean end.
     expect(text).toContain("event: message_stop");
-    const stops = (text.match(/event: message_stop/g) || []).length;
-    expect(stops).toBe(1);
+    expect((text.match(/event: message_stop/g) || []).length).toBe(1);
   });
 });
