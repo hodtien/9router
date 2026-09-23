@@ -125,7 +125,9 @@ describe("OpenCode free-tier request contract", () => {
 
     const chat = executor.transformRequest("mimo-v2.5-free", chatBody(), false, credentials);
     expect(chat.stream).toBe(true);
-    expect(chat.tools.map((tool) => tool.function.name)).toEqual(["_noop"]);
+    expect(chat.tools.map((tool) => tool.function.name)).toEqual([
+      "_noop", "bash", "glob", "grep", "read",
+    ]);
 
     const responses = executor.transformRequest(
       "muse-spark-1.3-contributor-free",
@@ -133,7 +135,9 @@ describe("OpenCode free-tier request contract", () => {
       false,
       credentials,
     );
-    expect(responses.tools.map((tool) => tool.name)).toEqual(["_noop"]);
+    expect(responses.tools.map((tool) => tool.name)).toEqual([
+      "_noop", "bash", "glob", "grep", "read",
+    ]);
 
     const anthropic = executor.transformRequest(
       "union-alpha",
@@ -153,7 +157,10 @@ describe("OpenCode free-tier request contract", () => {
       true,
       { _opencodeContractSession: "session-a" },
     );
-    expect(out.tools).toEqual([tool]);
+    expect(out.tools[0]).toEqual(tool);
+    expect(out.tools.slice(1).map((item) => item.function.name)).toEqual([
+      "bash", "glob", "grep", "read",
+    ]);
   });
 
   it("preserves Responses built-ins, custom tools, schemas and tool_choice exactly", () => {
