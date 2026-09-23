@@ -104,14 +104,20 @@ function getCodexSparkRateLimit(data) {
   }) || null;
 }
 
-export async function getCodexUsage(accessToken, proxyOptions = null) {
+export async function getCodexUsage(accessToken, proxyOptions = null, providerSpecificData = null) {
   try {
+    const accountId = getCodexAccountId(providerSpecificData);
+    const headers = {
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": "application/json",
+    };
+    if (accountId) {
+      headers["originator"] = `codex_cli_rs/${String(accountId).slice(0, 8)}`;
+      headers["ChatGPT-Account-ID"] = accountId;
+    }
     const response = await proxyAwareFetch(CODEX_CONFIG.usageUrl, {
       method: "GET",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Accept": "application/json",
-      },
+      headers,
     }, proxyOptions);
 
     if (!response.ok) {
@@ -148,11 +154,16 @@ export async function getCodexRateLimitResetCredits(accessToken, proxyOptions = 
   }
 
   const accountId = getCodexAccountId(providerSpecificData);
+  // Rotate the originator suffix per account to avoid the cross-account
+  // fingerprint collapse that OpenAI treats as bot/abuse.
+  const originator = accountId
+    ? `codex_cli_rs/${String(accountId).slice(0, 8)}`
+    : "codex_cli_rs";
   const headers = {
     "Authorization": `Bearer ${accessToken}`,
     "Accept": "application/json",
     "OpenAI-Beta": "codex-1",
-    "originator": "codex_cli_rs",
+    "originator": originator,
   };
   if (accountId) headers["ChatGPT-Account-ID"] = accountId;
 
