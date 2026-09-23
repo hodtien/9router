@@ -4,7 +4,7 @@
  * using Bun's native fetch (which carries the Bun TLS fingerprint that the
  * opencode free-tier gate accepts).
  *
- * Reads input from stdin: { url, headers, body, stream, proxyUrl? }
+ * Reads input from stdin: { url, headers, body, stream, proxyUrl?, vercelRelayUrl? }
  * Writes output to stdout:
  *   - non-stream: { status, headers, body }
  *   - stream: forwards raw SSE bytes as they arrive
@@ -28,14 +28,23 @@ for await (const chunk of Bun.stdin.stream()) {
   chunks.push(chunk);
 }
 const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-const { url, headers = {}, body = "", stream = false, proxyUrl } = input;
+const { url, headers = {}, body = "", stream = false, proxyUrl, strictProxy = false, vercelRelayUrl } = input;
 
+const relayTarget = vercelRelayUrl ? new URL(url) : null;
+const requestUrl = vercelRelayUrl || url;
+const requestHeaders = vercelRelayUrl
+  ? {
+    ...headers,
+    "x-relay-target": `${relayTarget.protocol}//${relayTarget.host}`,
+    "x-relay-path": `${relayTarget.pathname}${relayTarget.search}`,
+  }
+  : headers;
 const requestInit = {
   method: "POST",
-  headers,
+  headers: requestHeaders,
   body,
 };
-if (proxyUrl) {
+if (proxyUrl && !vercelRelayUrl) {
   // ponytail: Bun's `proxy` option accepts a URL string. We don't tunnel
   // through CONNECT (no `https` field) — opencode is HTTPS but the proxy
   // speaks plain HTTP, so Bun sends a plain HTTP request to the proxy with
@@ -46,9 +55,13 @@ if (proxyUrl) {
   requestInit.proxy = proxyUrl;
 }
 
+if (strictProxy && !proxyUrl && !vercelRelayUrl) {
+  throw new Error("OpenCode proxy is required but no proxy URL was provided");
+}
+
 if (stream) {
   // Streaming mode: forward raw bytes to stdout, exit when upstream closes.
-  const resp = await fetch(url, requestInit);
+  const resp = await fetch(requestUrl, requestInit);
   process.stdout.write(JSON.stringify({ status: resp.status, headers: Object.fromEntries(resp.headers) }) + "\n");
   if (!resp.body) {
     process.stdout.write("\n");
@@ -63,7 +76,7 @@ if (stream) {
   process.exit(0);
 }
 
-const resp = await fetch(url, requestInit);
+const resp = await fetch(requestUrl, requestInit);
 const text = await resp.text();
 process.stdout.write(JSON.stringify({
   status: resp.status,

@@ -78,8 +78,6 @@ describe("createSSEStream empty-claude envelope", () => {
     const text = await collect(stream, [": keep-alive\n\n"]);
     expect(text).not.toContain("message_start");
   });
-<<<<<<< HEAD
-=======
 
   it("synthesizes message_stop when upstream emits message_start but never closes", async () => {
     // Partial stream: upstream sent message_start + a few content blocks then
@@ -111,5 +109,4 @@ describe("createSSEStream empty-claude envelope", () => {
     const stops = (text.match(/event: message_stop/g) || []).length;
     expect(stops).toBe(1);
   });
->>>>>>> fix/stream-partial-terminal-synthesis
 });
