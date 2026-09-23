@@ -18,6 +18,7 @@ const STRIP_RULES = [
   { provider: "xai", match: /grok/i, drop: ["reasoning_effort", "reasoning", "thinking"] },
   // Cloudflare Workers AI: content must be plain string, rejects OpenAI content-part array (#1926)
   { provider: "cloudflare-ai", flattenContent: true },
+  { provider: "volcengine-ark", match: /glm-5/i, maxOutputCap: 128000, clampToModelMaxOutput: true },
   // Sakana fugu / fugu-ultra / fugu-ultra-20260615:
   //   - reasoning_effort only accepts `high` | `xhigh` | `max`. Any other value
   //     is rejected by the API. Claude Code may send `low`/`medium`/`minimal`,
@@ -38,6 +39,9 @@ const STRIP_RULES = [
     match: /(^|\/)fugu(-ultra)?(-[0-9]+)?$/i,
     dropReasoningObjectUnless: { field: "reasoning", allow: ["high", "xhigh", "max"] },
   },
+  { provider: "groq", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
+  { provider: "mistral", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
+  { provider: "cerebras", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
 ];
 
 // Enforce minimum values for params (e.g. max_tokens floor).
@@ -66,7 +70,6 @@ const MIN_RULES = [
   // MiMo Desktop Preview models (account-service route): content must be plain string,
   // rejects OpenAI content-part array. Cloud models keep their parts (mimo-v2-omni is multi-modal).
   { provider: "xiaomi-mimo", match: /preview/i, flattenContent: true },
-  { provider: "volcengine-ark", match: /glm-5/i, clampToModelMaxOutput: true },
   // VolcEngine Ark caps the Kimi family at max_tokens <= 32768, but the model's
   // advertised ceiling is far higher (Kimi-K2.7-Code resolves to maxOutput 262144),
   // so clampToModelMaxOutput alone leaves it uncapped and the request 400s with
@@ -116,6 +119,15 @@ export function stripUnsupportedParams(provider, model, body) {
       const obj = body[field];
       if (obj && typeof obj === "object" && !allow.includes(obj.effort)) {
         delete body[field];
+      }
+    }
+    // Per-message field drop (assistant turns only — that is where clients replay reasoning).
+    if (Array.isArray(rule.dropMessageFields) && Array.isArray(body.messages)) {
+      for (const msg of body.messages) {
+        if (!msg || msg.role !== "assistant") continue;
+        for (const key of rule.dropMessageFields) {
+          if (msg[key] !== undefined) delete msg[key];
+        }
       }
     }
     // CF Workers AI oneOf root schema only accepts content as plain string (#1926)

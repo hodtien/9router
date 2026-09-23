@@ -11,6 +11,9 @@ import { handleAntigravityQuotaError } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
+import { isOpencodeFreeTierRateLimitForProvider } from "open-sse/executors/opencodeGeoBlock.js";
+import { isGatedFreeTierRequest } from "open-sse/executors/opencodeFreeTierContract.js";
+import { refreshOpenCodeProfile } from "@/lib/opencodeProfile.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
@@ -43,6 +46,18 @@ function headersWithoutInternalBypass(headers) {
   return Object.fromEntries(
     [...headers.entries()].filter(([key]) => !INTERNAL_BYPASS_HEADERS.has(key.toLowerCase()))
   );
+}
+
+function profileProxyOptions(credentials) {
+  const data = credentials?.providerSpecificData || {};
+  return {
+    connectionProxyEnabled: data.connectionProxyEnabled === true,
+    connectionProxyUrl: data.connectionProxyUrl || "",
+    connectionNoProxy: data.connectionNoProxy || "",
+    connectionProxyPoolId: data.connectionProxyPoolId || null,
+    strictProxy: data.strictProxy === true,
+    vercelRelayUrl: data.vercelRelayUrl || "",
+  };
 }
 
 /**
@@ -348,6 +363,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
     // Use shared chatCore
     const chatSettings = await getSettings();
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
+    let opencodeFreeTierRateLimited = false;
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },
@@ -373,6 +389,15 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
       // Lazily warms the in-process module on first use; null when not installed (fail-open)
       pxpipeTransform: chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null,
       onPxpipeEvent: appendPxpipeEvent,
+      onProviderError: ({ provider: errorProvider, model: errorModel, status, bodyText }) => {
+        if (!isOpencodeFreeTierRateLimitForProvider(errorProvider, status, bodyText)
+          || !isGatedFreeTierRequest("zen", errorProvider, errorModel)) return;
+        opencodeFreeTierRateLimited = true;
+        refreshOpenCodeProfile({ proxyOptions: profileProxyOptions(refreshedCredentials) })
+          .then((profile) => log.info("OPENCODE_PROFILE", `${errorProvider}/${errorModel} | automatic refresh: ${profile.state}`))
+          .catch((error) => log.warn("OPENCODE_PROFILE", `automatic refresh failed: ${error.message}`));
+        log.warn("OPENCODE_PROFILE", `${errorProvider}/${errorModel} | 429 classified; returning upstream response without retry`);
+      },
       providerThinking,
       // Detect source format by endpoint + body
       sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
@@ -403,9 +428,11 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
-    const shouldFallback = provider === "antigravity" && quotaResetMs
-      ? true
-      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
+    const shouldFallback = opencodeFreeTierRateLimited
+      ? false
+      : (provider === "antigravity" && quotaResetMs
+        ? true
+        : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback);
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);

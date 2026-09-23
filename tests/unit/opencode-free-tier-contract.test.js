@@ -125,7 +125,9 @@ describe("OpenCode free-tier request contract", () => {
 
     const chat = executor.transformRequest("mimo-v2.5-free", chatBody(), false, credentials);
     expect(chat.stream).toBe(true);
-    expect(chat.tools.map((tool) => tool.function.name)).toEqual(["_noop"]);
+    expect(chat.tools.map((tool) => tool.function.name)).toEqual([
+      "_noop", "bash", "glob", "grep", "read",
+    ]);
 
     const responses = executor.transformRequest(
       "muse-spark-1.3-contributor-free",
@@ -133,7 +135,9 @@ describe("OpenCode free-tier request contract", () => {
       false,
       credentials,
     );
-    expect(responses.tools.map((tool) => tool.name)).toEqual(["_noop"]);
+    expect(responses.tools.map((tool) => tool.name)).toEqual([
+      "_noop", "bash", "glob", "grep", "read",
+    ]);
 
     const anthropic = executor.transformRequest(
       "union-alpha",
@@ -153,7 +157,10 @@ describe("OpenCode free-tier request contract", () => {
       true,
       { _opencodeContractSession: "session-a" },
     );
-    expect(out.tools).toEqual([tool]);
+    expect(out.tools[0]).toEqual(tool);
+    expect(out.tools.slice(1).map((item) => item.function.name)).toEqual([
+      "bash", "glob", "grep", "read",
+    ]);
   });
 
   it("preserves Responses built-ins, custom tools, schemas and tool_choice exactly", () => {
@@ -175,11 +182,59 @@ describe("OpenCode free-tier request contract", () => {
     expect(out.tool_choice).toBe(choice);
   });
 
-  it("routes union-alpha through the registered Claude translator", () => {
-    // union-alpha removed from registry 2026-09-19 — Zen returned 401
-    // "Model not supported" for this id. Re-enable test only if upstream
-    // brings the model back under a confirmed free-tier contract.
-    expect(getModelTargetFormat("oc", "union-alpha")).toBeNull();
+  it("routes union-alpha through the registered Claude Messages transport", () => {
+    const executor = new OpenCodeExecutor();
+    const target = getModelTargetFormat("oc", "union-alpha");
+    const translated = translateRequest(
+      FORMATS.OPENAI,
+      target,
+      "union-alpha",
+      {
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }],
+      },
+      true,
+      {},
+      "opencode",
+    );
+    const out = executor.transformRequest("union-alpha", translated, true, {});
+
+    expect(target).toBe(FORMATS.CLAUDE);
+    expect(executor.buildUrl("union-alpha")).toBe("https://opencode.ai/zen/v1/messages");
+    expect(executor.buildHeaders({}, true, "https://opencode.ai/zen/v1/messages", "union-alpha")["anthropic-version"]).toBe("2023-06-01");
+    expect(out.tools[0]).toMatchObject({ name: "lookup", input_schema: { type: "object" } });
+    expect(out.tools[0]).not.toHaveProperty("function");
+    expect(out.messages[0]).toMatchObject({ role: "user", content: [{ type: "text", text: "hi" }] });
+    expect(out.stream).toBe(true);
+  });
+
+  it("uses JSON transport headers for a paid non-streaming request", () => {
+    const executor = new OpenCodeExecutor();
+    const headers = executor.buildHeaders(
+      {},
+      false,
+      "https://opencode.ai/zen/v1/chat/completions",
+      "paid-model",
+    );
+
+    expect(headers.Accept).toBe("*/*");
+  });
+
+  it("does not force stream or inject tools for paid OpenCode models", () => {
+    const out = new OpenCodeExecutor().transformRequest(
+      "paid-model",
+      { model: "paid-model", messages: [{ role: "user", content: "hi" }] },
+      false,
+      { _opencodeContractSession: "session-a" },
+    );
+
+    expect(out.stream).toBe(false);
+    expect(out).not.toHaveProperty("tools");
+  });
+
+  it("does not declare provider-wide streaming", async () => {
+    const { PROVIDERS } = await import("../../open-sse/config/providers.js");
+    expect(PROVIDERS.opencode?.forceStream).toBeUndefined();
   });
 
   it("preserves the complete Responses terminal payload", async () => {
