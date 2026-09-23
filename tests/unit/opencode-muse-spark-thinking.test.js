@@ -183,13 +183,12 @@ describe("OpenCode Free Muse Spark thinking", () => {
     const types = out.input.map((item) => item.type);
     expect(types).toEqual(["message", "function_call", "function_call_output", "message"]);
     // Tools flattened and empty properties added
-    expect(out.tools).toEqual([
-      {
-        type: "function",
-        name: "shell",
-        description: "Run shell command",
-        parameters: { type: "object", properties: {} },
-      },
-    ]);
+    expect(out.tools[0]).toEqual({
+      type: "function",
+      name: "shell",
+      description: "Run shell command",
+      parameters: { type: "object", properties: {} },
+    });
+    expect(out.tools.slice(1).map((tool) => tool.name)).toEqual(["bash", "glob", "grep", "read"]);
   });
 });

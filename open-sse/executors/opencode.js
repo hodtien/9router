@@ -7,6 +7,7 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
+import { applyFingerprintTools, recordRenamedToolNames, takeRenamedToolNames } from "../utils/opencodeFingerprint.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
@@ -15,16 +16,11 @@ import {
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
 import {
-  applyFreeTierRecoveryContract,
   isGatedFreeTierRequest,
   noteFreeTierOutcome,
   prepareFreeTierRequest,
   rebuildJsonFromForcedStream,
 } from "./opencodeFreeTierContract.js";
-import {
-  isOpencodeFreeTierRateLimitForProvider,
-  isOpencodeFreeTierRefusalForProvider,
-} from "./opencodeGeoBlock.js";
 
 const OPENCODE_UA = "opencode/1.18.31";
 const MAX_TOOL_NAME_LEN = 128;
@@ -451,6 +447,8 @@ export class OpenCodeExecutor extends BaseExecutor {
     }
 
     const transformedBody = injectReasoningContent({ provider: this.provider, model, body });
+    const hadClientTools = Array.isArray(transformedBody?.tools) && transformedBody.tools.length > 0;
+    const hadClientToolChoice = transformedBody && Object.hasOwn(transformedBody, "tool_choice");
     const prepared = prepareFreeTierRequest(
       transformedBody,
       requestFormat,
@@ -461,6 +459,27 @@ export class OpenCodeExecutor extends BaseExecutor {
     );
     if (credentials && typeof credentials === "object") credentials[CONTRACT_ATTEMPT_FIELD] = prepared.attempt;
 
+    if (prepared.attempt && prepared.body && requestFormat === "openai-responses") {
+      const nativeTools = Array.isArray(transformedBody?.tools)
+        && transformedBody.tools.some((tool) => tool?.type !== "function");
+      if (nativeTools) {
+        prepared.body.tools = transformedBody.tools;
+        if (hadClientToolChoice) prepared.body.tool_choice = transformedBody.tool_choice;
+        else delete prepared.body.tool_choice;
+      } else {
+        const renamed = applyFingerprintTools(prepared.body, true);
+        if (!hadClientTools) prepared.body.tool_choice = "auto";
+        else if (hadClientToolChoice) prepared.body.tool_choice = transformedBody.tool_choice;
+        else delete prepared.body.tool_choice;
+        recordRenamedToolNames(body, renamed);
+      }
+    } else if (prepared.attempt && prepared.body && requestFormat === "openai") {
+      const renamed = applyFingerprintTools(prepared.body, false);
+      if (!hadClientTools) prepared.body.tool_choice = "none";
+      else if (hadClientToolChoice) prepared.body.tool_choice = transformedBody.tool_choice;
+      else delete prepared.body.tool_choice;
+      recordRenamedToolNames(body, renamed);
+    }
     if (!credentials) addUpstreamDecoys(prepared.body, requestFormat, true);
     return prepared.body;
   }
@@ -515,58 +534,22 @@ export class OpenCodeExecutor extends BaseExecutor {
   // a per-request Bun spawn — overhead is ~30ms cold. For high-throughput,
   // promote to a long-lived Bun child process that streams many requests.
   async execute(args = {}) {
-    const { model, body, credentials = {}, signal } = args;
-    const baseModel = baseModelId(model);
-    const canRecover = !args._opencodeRecoveryAttempt
-      && isGatedFreeTierRequest("zen", this.provider, baseModel)
-      && !signal?.aborted;
-    const first = await this._executeOnce(args);
-    if (!canRecover || ![403, 429, 451].includes(first.response.status)) return first;
-
-    let refusalBody;
-    try { refusalBody = await first.response.text(); } catch { return first; }
-    const isRefusal = isOpencodeFreeTierRefusalForProvider(this.provider, first.response.status, refusalBody);
-    const isRateLimit = isOpencodeFreeTierRateLimitForProvider(this.provider, first.response.status, refusalBody);
-    if (!isRefusal && !isRateLimit) {
-      return { ...first, response: new Response(refusalBody, { status: first.response.status, headers: first.response.headers }) };
-    }
-
-    const retryBody = applyFreeTierRecoveryContract(first.transformedBody || body, requestFormatForModel(model));
-    const retryCredentials = { ...credentials };
-    const retryHeaders = { ...(credentials.rawHeaders || {}) };
-    const suppliedSession = nativeSession(credentials.rawHeaders);
-    if (isRateLimit) {
-      retryHeaders[SESSION_HEADER] = generateSessionId();
-      retryHeaders["x-opencode-request"] = generateRequestId();
-      retryCredentials.rawHeaders = retryHeaders;
-    } else if (!suppliedSession) {
-      retryHeaders[SESSION_HEADER] = generateSessionId();
-      retryCredentials.rawHeaders = retryHeaders;
-    }
-    const retry = await this._executeOnce({
-      ...args,
-      body: retryBody,
-      credentials: retryCredentials,
-      _opencodeRecoveryAttempt: true,
-    }).catch(() => null);
-    if (retry?.response?.ok) {
-      noteFreeTierOutcome(first.contractAttempt, true);
-      return retry;
-    }
-    return { ...first, response: new Response(refusalBody, { status: first.response.status, headers: first.response.headers }) };
+    return this._executeOnce(args);
   }
 
-  async _executeOnce({ model, body, stream, credentials, signal, log, providerSessionId, clientTool, proxyOptions, _opencodeRecoveryAttempt = false, ...rest }) {
+  async _executeOnce({ model, body, stream, credentials, signal, log, providerSessionId, clientTool, proxyOptions }) {
     const clientRequestedStream = stream;
     const preparedCredentials = this.prepareRequestCredentials({ body, credentials, providerSessionId, clientTool });
     const url = this.buildUrl(model, stream, 0, preparedCredentials);
-    const transformedBody = this.transformRequest(model, { ...body, stream: !!stream }, stream, preparedCredentials);
+    const requestBody = { ...body, stream: !!stream };
+    const transformedBody = this.transformRequest(model, requestBody, stream, preparedCredentials);
+    recordRenamedToolNames(body, takeRenamedToolNames(requestBody));
     const upstreamStream = transformedBody?.stream === true;
     const headers = this.buildHeaders(preparedCredentials, upstreamStream, url, model);
     const attempt = preparedCredentials[CONTRACT_ATTEMPT_FIELD];
     const finalize = (result) => {
       result.contractAttempt = attempt;
-      if (!_opencodeRecoveryAttempt) noteFreeTierOutcome(attempt, result.response.ok);
+      noteFreeTierOutcome(attempt, result.response.ok);
       if (clientRequestedStream || !attempt) return result;
       const response = rebuildJsonFromForcedStream(
         result.response,
