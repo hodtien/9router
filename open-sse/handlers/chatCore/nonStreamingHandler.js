@@ -147,9 +147,8 @@ function openAICompletionToResponses(responseBody, customToolNames = null) {
 export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames = null) {
   if (targetFormat === sourceFormat) return responseBody;
   if (targetFormat === FORMATS.OPENAI_RESPONSES) {
-    return sourceFormat === FORMATS.CLAUDE
-      ? openAIResponsesBodyToClaude(responseBody)
-      : openAIResponsesBodyToOpenAI(responseBody);
+    if (sourceFormat === FORMATS.CLAUDE) return openAIResponsesBodyToClaude(responseBody);
+    if (sourceFormat === FORMATS.OPENAI) return openAIResponsesBodyToOpenAI(responseBody);
   }
   // Provider responded in OpenAI Chat Completions shape but the client speaks
   // Responses API — convert so tool_calls/text surface as Responses `output`.

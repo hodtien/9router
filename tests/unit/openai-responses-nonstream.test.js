@@ -101,6 +101,10 @@ describe("Responses JSON upstream for Chat and Claude clients", () => {
     expect(out.type).toBe("message");
     expect(out.content).toContainEqual({ type: "text", text: "hello" });
   });
+
+  it("leaves Responses output unchanged for non-OpenAI, non-Claude clients", () => {
+    expect(translateNonStreamingResponse(body, FORMATS.OPENAI_RESPONSES, FORMATS.GEMINI)).toBe(body);
+  });
 });
 
 describe("forced-SSE JSON path for a Responses-API client behind a chat upstream", () => {
