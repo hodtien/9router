@@ -78,4 +78,28 @@ describe("createSSEStream empty-claude envelope", () => {
     const text = await collect(stream, [": keep-alive\n\n"]);
     expect(text).not.toContain("message_start");
   });
+
+  it("synthesizes message_stop when upstream emits message_start but never closes", async () => {
+    const stream = createSSEStream({
+      mode: "translate",
+      targetFormat: "openai",
+      sourceFormat: "claude",
+      provider: "kiro",
+      model: "claude-opus-5",
+      connectionId: "c4",
+      body: { model: "claude-opus-5", messages: [] },
+    });
+    const partial = [
+      "event: message_start\n",
+      'data: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[]}}\n\n',
+      "event: content_block_start\n",
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      "event: content_block_delta\n",
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+    ].join("");
+    const text = await collect(stream, [partial]);
+    expect(text).toContain("event: message_start");
+    expect(text).toContain("event: message_stop");
+    expect((text.match(/event: message_stop/g) || []).length).toBe(1);
+  });
 });
