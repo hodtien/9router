@@ -39,6 +39,11 @@ export function isOpencodeFreeTierRefusal(status, bodyText) {
   return FREE_TIER_SIGNALS.some((signal) => lower.includes(signal));
 }
 
+export function isOpencodeFreeTierRefusalForProvider(provider, status, bodyText) {
+  return String(provider || "").toLowerCase().startsWith("opencode")
+    && isOpencodeFreeTierRefusal(status, bodyText);
+}
+
 export function isOpencodeFreeTierRateLimitForProvider(provider, status, bodyText) {
   if (!String(provider || "").toLowerCase().startsWith("opencode")) return false;
   if (Number(status) !== 429) return false;
@@ -49,9 +54,4 @@ export function isOpencodeFreeTierRateLimitForProvider(provider, status, bodyTex
   } catch {
     return /FreeUsageLimitError|FreeTierError/i.test(String(bodyText || ""));
   }
-}
-
-export function isOpencodeFreeTierRefusalForProvider(provider, status, bodyText) {
-  return String(provider || "").toLowerCase().startsWith("opencode")
-    && isOpencodeFreeTierRefusal(status, bodyText);
 }
