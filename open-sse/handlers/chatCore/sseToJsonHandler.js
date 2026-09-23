@@ -1,4 +1,5 @@
 import { convertResponsesStreamToJson } from "../../transformer/streamToJsonConverter.js";
+import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { FORMATS } from "../../translator/formats.js";
@@ -6,6 +7,9 @@ import { PROVIDERS } from "../../config/providers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { applyKiroCacheAccounting } from "../../utils/kiroCacheTracker.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { parseSSEToOpenAIResponse } from "../sseParser.js";
+
+export { parseSSEToOpenAIResponse } from "../sseParser.js";
 
 // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
 const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
@@ -107,80 +111,10 @@ function chatCompletionToResponses(responseBody, customToolNames = null) {
 }
 
 /**
- * Parse OpenAI-style SSE text into a single chat completion JSON.
- * Used when provider forces streaming but client wants non-streaming.
- */
-export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
-  const chunks = [];
-  let streamError = null;
-
-  for (const line of String(rawSSE || "").split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) continue;
-    const payload = trimmed.slice(5).trim();
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      const chunk = JSON.parse(payload);
-      if (chunk?.error) streamError = chunk.error;
-      else chunks.push(chunk);
-    } catch { /* ignore malformed lines */ }
-  }
-
-  if (streamError) return { error: streamError };
-  if (chunks.length === 0) return null;
-
-  const first = chunks[0];
-  const contentParts = [];
-  const reasoningParts = [];
-  const toolCallMap = new Map(); // index -> { id, type, function: { name, arguments } }
-  let finishReason = "stop";
-  let usage = null;
-
-  for (const chunk of chunks) {
-    const choice = chunk?.choices?.[0];
-    const delta = choice?.delta || {};
-    if (typeof delta.content === "string" && delta.content.length > 0) contentParts.push(delta.content);
-    if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) reasoningParts.push(delta.reasoning_content);
-    if (choice?.finish_reason) finishReason = choice.finish_reason;
-    if (chunk?.usage && typeof chunk.usage === "object") usage = chunk.usage;
-
-    // Accumulate tool_calls from streaming deltas
-    if (Array.isArray(delta.tool_calls)) {
-      for (const tc of delta.tool_calls) {
-        const idx = tc.index ?? 0;
-        if (!toolCallMap.has(idx)) {
-          toolCallMap.set(idx, { id: tc.id || "", type: "function", function: { name: "", arguments: "" } });
-        }
-        const existing = toolCallMap.get(idx);
-        if (tc.id) existing.id = tc.id;
-        if (tc.function?.name) existing.function.name += tc.function.name;
-        if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
-      }
-    }
-  }
-
-  const message = { role: "assistant", content: contentParts.join("") || (toolCallMap.size > 0 ? null : "") };
-  if (reasoningParts.length > 0) message.reasoning_content = reasoningParts.join("");
-  if (toolCallMap.size > 0) {
-    message.tool_calls = [...toolCallMap.entries()].sort((a, b) => a[0] - b[0]).map(([, tc]) => tc);
-  }
-
-  const result = {
-    id: first.id || `chatcmpl-${Date.now()}`,
-    object: "chat.completion",
-    created: first.created || Math.floor(Date.now() / 1000),
-    model: first.model || fallbackModel || "unknown",
-    choices: [{ index: 0, message, finish_reason: finishReason }]
-  };
-  if (usage) result.usage = usage;
-  return result;
-}
-
-/**
  * Handle case: provider forced streaming but client wants JSON.
  * Supports both Codex/Responses API SSE and standard Chat Completions SSE.
  */
-export async function handleForcedSSEToJson({ providerResponse, sourceFormat, targetFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, customToolNames, trackDone, appendLog, reqTag, log }) {
+export async function handleForcedSSEToJson({ providerResponse, sourceFormat, targetFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, customToolNames, toolNameMap, trackDone, appendLog, reqTag, log }) {
   const contentType = providerResponse.headers.get("content-type") || "";
   const isSSE = contentType.includes("text/event-stream") || (contentType === "" && isResponsesProvider(provider));
   if (!isSSE) return null; // not handled here
@@ -226,7 +160,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
 
       // Client is Responses API → return as-is
       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
-        return { success: true, response: new Response(JSON.stringify(jsonResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+        return { success: true, response: new Response(JSON.stringify(restoreToolNames(jsonResponse, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
       }
 
       // Build client-format response.
@@ -282,7 +216,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
         };
       }
 
-      return { success: true, response: new Response(JSON.stringify(finalResp), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+      return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalResp, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
     } catch (err) {
       console.error("[ChatCore] Responses API SSE→JSON failed:", err);
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");
@@ -295,8 +229,16 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
     if (parsed.error) {
+      // Structured error chunks may carry the real upstream status (e.g. the
+      // Qoder executor emits status 403 for billing envelopes). Preserve it so
+      // the account loop locks/falls back on the right status instead of a
+      // generic 502. Anything outside 400-599 still maps to 502.
+      const upstreamStatus = Number(parsed.error.status);
+      const status = Number.isInteger(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus <= 599
+        ? upstreamStatus
+        : HTTP_STATUS.BAD_GATEWAY;
       return createErrorResult(
-        HTTP_STATUS.BAD_GATEWAY,
+        status,
         parsed.error.message || "Upstream SSE stream failed"
       );
     }
@@ -354,7 +296,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
       ? chatCompletionToResponses(parsed, customToolNames)
       : parsed;
 
-    return { success: true, response: new Response(JSON.stringify(finalBody), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+    return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
   } catch (err) {
     console.error("[ChatCore] Chat Completions SSE→JSON failed:", err);
     return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert streaming response to JSON");

@@ -1,34 +1,68 @@
 import crypto from "crypto";
 import { BaseExecutor } from "./base.js";
+import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { PROVIDERS } from "../config/providers.js";
+import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
+import { applyFingerprintTools, recordRenamedToolNames, takeRenamedToolNames } from "../utils/opencodeFingerprint.js";
+import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
   coerceResponsesArguments,
   coerceResponsesOutput,
 } from "../translator/formats/responsesApi.js";
+import {
+  isGatedFreeTierRequest,
+  noteFreeTierOutcome,
+  prepareFreeTierRequest,
+  rebuildJsonFromForcedStream,
+} from "./opencodeFreeTierContract.js";
 
-// ponytail: opencode gate checks the UA prefix+version. Match the opencode
-// CLI's desktop UA exactly so the free-tier gate fingerprint lines up. If
-// upstream rotates the version, hardcode the new one here. ponytail: include
-// the bun/ai-sdk trailer so the fingerprint matches what the desktop CLI sends.
-const OPENCODE_UA = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14";
+const OPENCODE_UA = "opencode/1.18.31";
 const MAX_TOOL_NAME_LEN = 128;
 const MAX_SESSION_LENGTH = 256;
 const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
+const CONTRACT_SESSION_FIELD = "_opencodeContractSession";
+const CONTRACT_ATTEMPT_FIELD = "_opencodeContractAttempt";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-// ponytail: upstream free-tier gate (verified live 2026-09-18 via decolua/9router
-// PR #4132) fingerprints the official agentic client on four axes: UA version,
-// canonical session shape, the file-search tool quartet {bash, glob, grep, read},
-// and streaming. Plain chat callers send no tools, so without injection every
-// such request 403s. Extras upstream are allowed (we only append missing names).
-const OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"];
+const OPENCODE_REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const REQ_FIELD = "_opencodeRequest";
+const OPENCODE_DECOY_RESPONSES_TOOLS = [
+  { type: "function", name: "bash", description: "This tool is currently unavailable and must not be used.", parameters: { type: "object", properties: {} } },
+  { type: "function", name: "read", description: "This tool is currently unavailable and must not be used.", parameters: { type: "object", properties: {} } },
+];
+const OPENCODE_DECOY_CHAT_TOOLS = OPENCODE_DECOY_RESPONSES_TOOLS.map((tool) => ({
+  type: "function",
+  function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+}));
+
+function cloakOpencodeTools(body, isResponses) {
+  if (!body || typeof body !== "object") return;
+  if (isResponses) {
+    if (!Array.isArray(body.tools)) body.tools = [];
+    const names = new Set(body.tools.map((tool) => tool.name || tool.function?.name));
+    for (const tool of OPENCODE_DECOY_RESPONSES_TOOLS) {
+      if (!names.has(tool.name)) body.tools.push({ ...tool, parameters: { ...tool.parameters } });
+    }
+    if (!body.tool_choice) body.tool_choice = "auto";
+    return;
+  }
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
+    body.tools = OPENCODE_DECOY_CHAT_TOOLS.map((tool) => ({ ...tool, function: { ...tool.function, parameters: { ...tool.function.parameters } } }));
+    if (!body.tool_choice) body.tool_choice = "none";
+    return;
+  }
+  const names = new Set(body.tools.map((tool) => tool.function?.name || tool.name));
+  for (const tool of OPENCODE_DECOY_CHAT_TOOLS) {
+    if (!names.has(tool.function.name)) body.tools.push({ ...tool, function: { ...tool.function, parameters: { ...tool.function.parameters } } });
+  }
+}
 
 function hasValidOpencodeVersion(ua) {
   const m = String(ua || "").match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
@@ -42,13 +76,7 @@ const RESPONSES_MODELS = new Set([
   "muse-spark-1.2-contributor-free",
   "muse-spark-1.3-contributor-free",
 ]);
-// ponytail: a few upstream models (e.g. union-alpha) live on /zen/v1/messages,
-// the Anthropic Messages protocol — not OpenAI chat completions. Same free
-// gate (Bearer public) + same session header shape.
-const ANTHROPIC_MESSAGES_MODELS = new Set([
-  "union-alpha",
-]);
-
+const ANTHROPIC_MESSAGES_MODELS = new Set(["union-alpha"]);
 // ponytail: replicate opencode's canonical `descending()` from
 // packages/schema/src/identifier.ts. First 12 hex chars come from a per-ms
 // counter (not a hardcoded +1), so two requests landing in the same millisecond
@@ -118,92 +146,70 @@ function normalizeSession(value) {
   return normalized;
 }
 
-function nativeSession(headers) {
+function clientSuppliedSession(headers) {
   if (!headers || typeof headers !== "object") return null;
+  let fallback = null;
   for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === SESSION_HEADER) {
-      const normalized = normalizeSession(value);
-      if (normalized && OPENCODE_SESSION_RE.test(normalized)) return normalized;
-    }
+    const normalizedKey = key.toLowerCase();
+    if (normalizedKey !== SESSION_HEADER && normalizedKey !== "x-session-id") continue;
+    const normalized = normalizeSession(value);
+    if (!normalized) continue;
+    if (normalizedKey === SESSION_HEADER) return normalized;
+    fallback = normalized;
   }
-  return null;
+  return fallback;
 }
 
-// ponytail: opencode upstream binds the request to a project hash derived
-// from the workspace cwd. The desktop CLI passes a sha1 of the directory
-// path; the bun/ai-sdk client (used by groxy from outside a project) sends
-// "global" when no workspace is loaded. Use OPENCODE_PROJECT_ID env to
-// pin a specific project, otherwise fall back to "global" so the upstream
-// match the no-workspace case. ponytail: track upstream's project hash
-// scheme by mirroring the desktop CLI's sha1(path) → hex if env is unset
-// and cwd is meaningful.
-function resolveProjectId() {
-  const envId = process.env.OPENCODE_PROJECT_ID?.trim();
-  if (envId) return envId;
-  return "global";
+function nativeSession(headers) {
+  const session = clientSuppliedSession(headers);
+  return session && OPENCODE_SESSION_RE.test(session) ? session : null;
 }
 
-// ponytail: opencode's free-tier gate rejects fresh session IDs because the
-// server only honors sessions that exist in its active-session table. Those
-// entries are issued when a client authenticates with the upstream OAuth
-// (or, for the public-bearer fallback, when the opencode desktop app posts
-// a session over its long-lived WebSocket).
-//
-// Resolution order (first hit wins):
-//   1. OPENCODE_SESSION_ID env — set this on headless boxes (VPS, CI) after
-//      running `opencode run` once and grepping the resulting session id
-//      out of the local opencode SQLite db (the desktop app's window data
-//      file is not present).
-//   2. Active session id parsed from the opencode desktop's window data
-//      files (`opencode.window.*.dat`) — works on dev boxes that also run
-//      the desktop app.
-//   3. Fresh `ses_<descending>` — kept for the cache-miss case so we still
-//      produce a syntactically valid header even when no upstream session
-//      is available; the request will 403, but the executor surfaces the
-//      error rather than failing on a malformed header.
-//
-// Cache the resolved id by file mtime so a restart of opencode (which
-// issues a fresh session) invalidates the cache on the next request.
-let _sessionCache = { mtimeMs: 0, id: null, scannedAt: 0 };
-const SESSION_SCAN_TTL_MS = 60_000;
-
-async function readActiveOpencodeSession() {
+const stableOpencodeSessions = new Map();
+const MAX_STABLE_SESSIONS = 1000;
+const stableSessionCleanup = setInterval(() => {
   const now = Date.now();
-  if (_sessionCache.id && (now - _sessionCache.scannedAt) < SESSION_SCAN_TTL_MS) {
-    return _sessionCache.id;
+  for (const [key, entry] of stableOpencodeSessions) {
+    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) stableOpencodeSessions.delete(key);
   }
-  // Highest priority: pinned env var. Cache hit so repeated reads stay free.
-  const envId = process.env.OPENCODE_SESSION_ID?.trim();
-  if (envId) {
-    _sessionCache = { mtimeMs: 0, id: envId, scannedAt: now };
-    return envId;
+}, MEMORY_CONFIG.sessionCleanupIntervalMs);
+if (stableSessionCleanup.unref) stableSessionCleanup.unref();
+
+function identityKey(credentials) {
+  const connectionId = credentials?.connectionId || credentials?.id;
+  if (connectionId) return `opencode:conn:${String(connectionId).slice(0, 128)}`;
+  const raw = credentials?.rawHeaders || {};
+  const auth = raw.authorization || raw.Authorization || raw["x-api-key"] || raw["X-Api-Key"] || "";
+  if (auth) return `opencode:auth:${crypto.createHash("sha256").update(String(auth)).digest("hex").slice(0, 32)}`;
+  return "opencode:default";
+}
+
+export function stableSessionId(credentials) {
+  const key = identityKey(credentials);
+  const existing = stableOpencodeSessions.get(key);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    stableOpencodeSessions.delete(key);
+    stableOpencodeSessions.set(key, existing);
+    return existing.sessionId;
   }
-  const fs = await import("node:fs/promises");
-  const path = await import("node:path");
-  const home = process.env.HOME || process.env.USERPROFILE;
-  if (!home) return null;
-  const dir = path.join(home, "Library", "Application Support", "ai.opencode.desktop");
-  let files;
-  try { files = await fs.readdir(dir); } catch { return null; }
-  let best = null;
-  for (const name of files) {
-    if (!name.startsWith("opencode.window.") || !name.endsWith(".dat")) continue;
-    const fullPath = path.join(dir, name);
-    try {
-      const stat = await fs.stat(fullPath);
-      if (!best || stat.mtimeMs > best.mtimeMs) best = { fullPath, mtimeMs: stat.mtimeMs };
-    } catch {}
-  }
-  if (!best) return null;
-  if (best.mtimeMs === _sessionCache.mtimeMs && _sessionCache.id) return _sessionCache.id;
-  let raw;
-  try { raw = await fs.readFile(best.fullPath, "utf8"); } catch { return null; }
-  const matches = raw.match(/ses_[A-Za-z0-9]+/g) || [];
-  // Pick the most recently referenced session id — the order in the JSON
-  // mirrors the tab order, with the active tab last.
-  const id = matches.length ? matches[matches.length - 1] : null;
-  _sessionCache = { mtimeMs: best.mtimeMs, id, scannedAt: now };
-  return id;
+  const sessionId = generateSessionId();
+  if (stableOpencodeSessions.size >= MAX_STABLE_SESSIONS) stableOpencodeSessions.delete(stableOpencodeSessions.keys().next().value);
+  stableOpencodeSessions.set(key, { sessionId, lastUsed: Date.now() });
+  return sessionId;
+}
+
+function normalizeRequestId(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return OPENCODE_REQUEST_RE.test(normalized) ? normalized : null;
+}
+
+function resolveOpencodeRequestId(body, credentials, sessionId) {
+  const raw = credentials?.rawHeaders || {};
+  const downstream = normalizeRequestId(raw["x-opencode-request"] || raw["X-OpenCode-Request"]);
+  if (downstream) return downstream;
+  return generateRequestId();
 }
 
 // Strip the thinking suffix "model(level)" so registry lookups hit the base id.
@@ -220,6 +226,65 @@ function isAnthropicMessagesModel(model) {
   return ANTHROPIC_MESSAGES_MODELS.has(baseModelId(model));
 }
 
+function requestFingerprint(body) {
+  if (!body || typeof body !== "object") return "";
+  const conversation = Array.isArray(body.messages)
+    ? body.messages
+    : Array.isArray(body.input)
+      ? body.input
+      : body.input;
+  if (conversation == null) return "";
+  try {
+    return JSON.stringify(conversation);
+  } catch {
+    return String(conversation);
+  }
+}
+
+export function deriveRequestId(sessionId, body) {
+  const fingerprint = requestFingerprint(body);
+  if (!fingerprint) return generateRequestId();
+  const digest = crypto.createHash("sha256").update(`opencode-req\0${sessionId || ""}\0${fingerprint}`).digest();
+  return `msg_${digest.subarray(0, 6).toString("hex")}${Array.from(digest.subarray(6, 20), (b) => BASE62_CHARS[b % 62]).join("")}`;
+}
+
+function requestFormatForModel(model) {
+  if (isResponsesModel(model)) return "openai-responses";
+  return "openai";
+}
+
+function replacePlaceholderWithDecoys(body, requestFormat) {
+  if (!body || !Array.isArray(body.tools) || body.tools.length !== 1) return false;
+  const name = body.tools[0]?.name || body.tools[0]?.function?.name;
+  if (name !== "_noop") return false;
+  if (requestFormat === "openai-responses") {
+    body.tools = OPENCODE_DECOY_RESPONSES_TOOLS.map((tool) => ({
+      ...tool,
+      parameters: { ...tool.parameters, properties: { ...tool.parameters.properties } },
+    }));
+    if (!body.tool_choice) body.tool_choice = "auto";
+    return true;
+  }
+  if (requestFormat === "openai") {
+    body.tools = OPENCODE_DECOY_CHAT_TOOLS.map((tool) => ({
+      ...tool,
+      function: { ...tool.function, parameters: { ...tool.function.parameters, properties: { ...tool.function.parameters.properties } } },
+    }));
+    if (!body.tool_choice) body.tool_choice = "none";
+    return true;
+  }
+  return false;
+}
+
+function addUpstreamDecoys(body, requestFormat, appendExisting = false) {
+  if (!body) return;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    if (replacePlaceholderWithDecoys(body, requestFormat)) return;
+    if (!appendExisting || requestFormat !== "openai") return;
+  }
+  if (requestFormat === "openai") cloakOpencodeTools(body, false);
+}
+
 function resolveOpencodeSession(body, credentials, providerSessionId, clientTool) {
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
@@ -233,31 +298,35 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     }
   }
 
-  const resolved = incoming || normalizeSession(providerSessionId) || resolveSessionId({
-    headers,
-    body,
-    connectionId: credentials?.connectionId,
-    scope: "opencode",
-  });
-
-  return resolved ? translateSessionId(resolved, clientTool) : generateSessionId();
+  const hinted = incoming || normalizeSession(providerSessionId);
+  if (hinted) return translateSessionId(hinted, clientTool);
+  if (credentials?.connectionId || body?.session_id || body?.conversation_id || body?.prompt_cache_key) {
+    const resolved = resolveSessionId({ headers, body, connectionId: credentials?.connectionId, scope: "opencode" });
+    if (resolved) return translateSessionId(resolved, clientTool);
+  }
+  return stableSessionId(credentials);
 }
 
 function normalizeResponsesTools(body) {
   if (!Array.isArray(body.tools)) return;
+  const hasLegacyTools = body.tools.some((tool) => tool?.function && typeof tool.function === "object" && !Array.isArray(tool.function));
+  if (!hasLegacyTools) return;
+
   const validNames = new Set();
   body.tools = body.tools.filter((tool) => {
-    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false;
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return true;
     const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
-    const rawName = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
-    const name = rawName.trim();
+    if (!fn) return true;
+    const name = typeof fn.name === "string" ? fn.name.trim() : "";
     if (!name) return false;
-    const description = typeof tool.description === "string" ? tool.description : (typeof fn?.description === "string" ? fn.description : "");
-    let parameters = (tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters))
-      ? tool.parameters
-      : (fn?.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters) ? fn.parameters : { type: "object", properties: {} });
-    if (parameters.type === "object" && !parameters.properties) parameters = { ...parameters, properties: {} };
-    for (const k of Object.keys(tool)) delete tool[k];
+    const description = typeof fn.description === "string" ? fn.description : "";
+    let parameters = fn.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters)
+      ? fn.parameters
+      : { type: "object", properties: {} };
+    if (parameters.type === "object" && !parameters.properties) {
+      parameters = { ...parameters, properties: {} };
+    }
+    for (const key of Object.keys(tool)) delete tool[key];
     tool.type = "function";
     tool.name = name.slice(0, MAX_TOOL_NAME_LEN);
     if (description) tool.description = description;
@@ -265,74 +334,10 @@ function normalizeResponsesTools(body) {
     validNames.add(tool.name);
     return true;
   });
-  if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)) {
-    if (body.tool_choice.type === "function") {
-      const n = typeof body.tool_choice.name === "string" ? body.tool_choice.name.trim() : "";
-      if (!n || !validNames.has(n)) delete body.tool_choice;
-    }
-  }
-}
-
-function toolNameOf(tool) {
-  if (!tool || typeof tool !== "object" || Array.isArray(tool)) return "";
-  const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
-  const raw = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
-  return raw.trim();
-}
-
-// ponytail: merge the upstream-mandated file-search quartet into Chat Completions
-// bodies. Caller tools are preserved verbatim (extras are allowed upstream);
-// only the missing fingerprint names are appended as no-op declarations the
-// model may ignore. Without this, plain chat callers that send no tools get
-// 403 FreeTierError on every request.
-function ensureChatFingerprintTools(body) {
-  if (!body || typeof body !== "object") return;
-  const present = new Set();
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      const name = toolNameOf(tool);
-      if (name) present.add(name);
-    }
-  } else {
-    body.tools = [];
-  }
-  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
-    if (present.has(name)) continue;
-    body.tools.push({
-      type: "function",
-      function: {
-        name,
-        description: `OpenCode built-in ${name} tool`,
-        parameters: { type: "object", properties: {} },
-      },
-    });
-    present.add(name);
-  }
-}
-
-// ponytail: same fingerprint for the Responses flat tool shape. Runs before
-// normalizeResponsesTools so injected declarations get the same coercion as
-// caller tools.
-function ensureResponsesFingerprintTools(body) {
-  if (!body || typeof body !== "object") return;
-  const present = new Set();
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      const name = toolNameOf(tool);
-      if (name) present.add(name);
-    }
-  } else {
-    body.tools = [];
-  }
-  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
-    if (present.has(name)) continue;
-    body.tools.push({
-      type: "function",
-      name,
-      description: `OpenCode built-in ${name} tool`,
-      parameters: { type: "object", properties: {} },
-    });
-    present.add(name);
+  if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)
+    && body.tool_choice.type === "function") {
+    const name = typeof body.tool_choice.name === "string" ? body.tool_choice.name.trim() : "";
+    if (!name || !validNames.has(name)) delete body.tool_choice;
   }
 }
 
@@ -405,62 +410,78 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       ...sourceCredentials,
       [SESSION_FIELD]: resolved,
+      [REQ_FIELD]: resolveOpencodeRequestId(body, sourceCredentials, resolved),
+      [CONTRACT_SESSION_FIELD]: clientSuppliedSession(sourceCredentials.rawHeaders) || undefined,
     };
   }
 
   transformRequest(model, body, stream, credentials) {
     if (body && typeof body === "object" && model && !body.model) body.model = model;
-    if (body && typeof body === "object") {
-      // ponytail: upstream rejects non-streaming free-tier requests with 403
-      // even when everything else is valid. chatCore converts back to JSON
-      // for non-stream clients via the existing forced-SSE path, so always
-      // send stream:true upstream here.
-      body.stream = true;
-    }
+    let requestFormat = isAnthropicMessagesModel(model) ? "claude" : "openai";
     if (isResponsesModel(model || body?.model) && body && typeof body === "object") {
+      requestFormat = "openai-responses";
+      const realRequestCredentials = credentials?.connectionId || credentials?.rawHeaders;
+      if ("tool_choice" in body
+        && body.tool_choice !== "auto"
+        && realRequestCredentials
+        && this.config.quirks?.forceAutoToolChoiceModels?.includes(baseModelId(model))) {
+        body.tool_choice = "auto";
+      }
       const normalized = normalizeResponsesInput(body.input);
       if (normalized) body.input = normalized;
       if (!Array.isArray(body.input) || body.input.length === 0) {
         body.input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "..." }] }];
       }
-      // Responses API names the output cap max_output_tokens and takes thinking
-      // as reasoning:{effort,summary} — normalize the Chat fields at this boundary.
-      const clientCap = body.max_output_tokens
-        ?? body.max_completion_tokens
-        ?? body.max_tokens;
-      if (clientCap === undefined || clientCap < 16) {
-        body.max_output_tokens = 100000;
-      } else if (body.max_output_tokens === undefined) {
-        body.max_output_tokens = clientCap;
-      }
+      const clientCap = body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
+      if (clientCap === undefined || clientCap < 16) body.max_output_tokens = 100000;
+      else if (body.max_output_tokens === undefined) body.max_output_tokens = clientCap;
       delete body.max_tokens;
       delete body.max_completion_tokens;
       normalizeOpencodeReasoning(model, body);
+      body.stream = !!stream;
       body.store = false;
-      ensureResponsesFingerprintTools(body);
       normalizeResponsesTools(body);
       sanitizeResponsesItems(body);
-      return injectReasoningContent({ provider: this.provider, model, body });
+    } else if (body && typeof body === "object") {
+      body.stream = !!stream;
     }
-    // ponytail: Anthropic Messages uses max_tokens and a separate
-    // reasoning:{effort} envelope (no max_output_tokens). The translator
-    // already emits Anthropic-shape bodies when targetFormat=anthropic-messages,
-    // so we only strip chat-only fields here. The same upstream gate that
-    // fingerprints the chat quartet also fingerprints the Messages request,
-    // so inject the same no-op tool declarations so union-alpha doesn't 403.
-    if (isAnthropicMessagesModel(model) && body && typeof body === "object") {
-      delete body.max_output_tokens;
-      if (body.max_tokens === undefined || body.max_tokens < 16) {
-        body.max_tokens = 100000;
+
+    const transformedBody = injectReasoningContent({ provider: this.provider, model, body });
+    const hadClientTools = Array.isArray(transformedBody?.tools) && transformedBody.tools.length > 0;
+    const hadClientToolChoice = transformedBody && Object.hasOwn(transformedBody, "tool_choice");
+    const prepared = prepareFreeTierRequest(
+      transformedBody,
+      requestFormat,
+      "zen",
+      this.provider,
+      baseModelId(model),
+      credentials?.[CONTRACT_SESSION_FIELD],
+    );
+    if (credentials && typeof credentials === "object") credentials[CONTRACT_ATTEMPT_FIELD] = prepared.attempt;
+
+    if (prepared.attempt && prepared.body && requestFormat === "openai-responses") {
+      const nativeTools = Array.isArray(transformedBody?.tools)
+        && transformedBody.tools.some((tool) => tool?.type !== "function");
+      if (nativeTools) {
+        prepared.body.tools = transformedBody.tools;
+        if (hadClientToolChoice) prepared.body.tool_choice = transformedBody.tool_choice;
+        else delete prepared.body.tool_choice;
+      } else {
+        const renamed = applyFingerprintTools(prepared.body, true);
+        if (!hadClientTools) prepared.body.tool_choice = "auto";
+        else if (hadClientToolChoice) prepared.body.tool_choice = transformedBody.tool_choice;
+        else delete prepared.body.tool_choice;
+        recordRenamedToolNames(body, renamed);
       }
-      normalizeOpencodeReasoning(model, body);
-      ensureChatFingerprintTools(body);
-      return injectReasoningContent({ provider: this.provider, model, body });
+    } else if (prepared.attempt && prepared.body && requestFormat === "openai") {
+      const renamed = applyFingerprintTools(prepared.body, false);
+      if (!hadClientTools) prepared.body.tool_choice = "none";
+      else if (hadClientToolChoice) prepared.body.tool_choice = transformedBody.tool_choice;
+      else delete prepared.body.tool_choice;
+      recordRenamedToolNames(body, renamed);
     }
-    if (body && typeof body === "object") {
-      ensureChatFingerprintTools(body);
-    }
-    return injectReasoningContent({ provider: this.provider, model, body });
+    if (!credentials) addUpstreamDecoys(prepared.body, requestFormat, true);
+    return prepared.body;
   }
 
   buildUrl(model) {
@@ -470,13 +491,21 @@ export class OpenCodeExecutor extends BaseExecutor {
     return `${base}/zen/v1/chat/completions`;
   }
 
-  buildHeaders(credentials, stream = true) {
+  buildHeaders(credentials, stream = true, url = null, model = "") {
     const raw = credentials?.rawHeaders || {};
     const lower = {};
     for (const [k, v] of Object.entries(raw)) lower[k.toLowerCase()] = v;
 
     const downstreamUa = lower["user-agent"] || "";
-    const isOpencodeDownstream = hasValidOpencodeVersion(downstreamUa);
+    const downstreamClient = lower["x-opencode-client"];
+    const gated = isGatedFreeTierRequest("zen", this.provider, baseModelId(model));
+    const synthesize = !/^(0|false|no|off)$/i.test(process.env.OPENCODE_SYNTHESIZE_CLI_HEADERS?.trim() || "");
+    const configuredUa = process.env.OPENCODE_USER_AGENT?.trim();
+    const defaultUa = configuredUa && (!gated || hasValidOpencodeVersion(configuredUa))
+      ? configuredUa : OPENCODE_UA;
+    const userAgent = hasValidOpencodeVersion(downstreamUa) ? downstreamUa : (synthesize ? defaultUa : null);
+    const client = downstreamClient || (synthesize ? process.env.OPENCODE_CLIENT?.trim() || "desktop" : null);
+    const project = lower["x-opencode-project"] || (synthesize ? process.env.OPENCODE_PROJECT?.trim() || "global" : null);
 
     const prepared = credentials?.[SESSION_FIELD]
       || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
@@ -484,15 +513,16 @@ export class OpenCodeExecutor extends BaseExecutor {
     return {
       "Content-Type": "application/json",
       "Authorization": "Bearer public",
-      "User-Agent": isOpencodeDownstream ? downstreamUa : OPENCODE_UA,
-      "x-opencode-client": lower["x-opencode-client"] || "desktop",
+      ...(userAgent ? { "User-Agent": userAgent } : {}),
+      ...(client ? { "x-opencode-client": client } : {}),
       "x-opencode-session": prepared,
-      "x-opencode-request": lower["x-opencode-request"] || generateRequestId(),
-      "x-opencode-project": lower["x-opencode-project"] || resolveProjectId(),
-      "Accept": stream ? "text/event-stream" : "*/*",
+      "x-opencode-request": credentials?.[REQ_FIELD] || normalizeRequestId(lower["x-opencode-request"]) || generateRequestId(),
+      ...(project ? { "x-opencode-project": project } : {}),
+      "Accept": stream || gated ? "text/event-stream" : "*/*",
       "Accept-Language": lower["accept-language"] || "*",
       "sec-fetch-mode": lower["sec-fetch-mode"] || "cors",
       "Accept-Encoding": lower["accept-encoding"] || "br, gzip, deflate",
+      ...(url?.endsWith("/messages") ? { "anthropic-version": ANTHROPIC_API_VERSION } : {}),
     };
   }
 
@@ -503,26 +533,42 @@ export class OpenCodeExecutor extends BaseExecutor {
   // the actual HTTP request and pipes the response back. ponytail: this is
   // a per-request Bun spawn — overhead is ~30ms cold. For high-throughput,
   // promote to a long-lived Bun child process that streams many requests.
-  async execute({ model, body, stream, credentials, signal, log, providerSessionId, clientTool, ...rest }) {
-    // ponytail: load the opencode desktop's active session id from its window
-    // data file before building headers. Without this, the server returns 403
-    // because fresh session ids are not in the active-session table. Cache
-    // miss is fine — the executor falls back to a generated descending id.
-    if (!this._persistedSession) {
-      try { this._persistedSession = await readActiveOpencodeSession(); }
-      catch { this._persistedSession = null; }
-    }
+  async execute(args = {}) {
+    return this._executeOnce(args);
+  }
+
+  async _executeOnce({ model, body, stream, credentials, signal, log, providerSessionId, clientTool, proxyOptions }) {
+    const clientRequestedStream = stream;
     const preparedCredentials = this.prepareRequestCredentials({ body, credentials, providerSessionId, clientTool });
-    // ponytail: surface the desktop session id to the resolver as a soft
-    // override so translateSessionId() hashes it deterministically rather
-    // than the conversation session. Lets a single pinned session serve
-    // many concurrent conversations without per-conversation 403s.
-    if (this._persistedSession && preparedCredentials[SESSION_FIELD] === generateSessionId()) {
-      // skip — fallback path, don't override
-    }
     const url = this.buildUrl(model, stream, 0, preparedCredentials);
-    const transformedBody = this.transformRequest(model, body, stream, preparedCredentials);
-    const headers = this.buildHeaders(preparedCredentials, stream, url, model);
+    const requestBody = { ...body, stream: !!stream };
+    const transformedBody = this.transformRequest(model, requestBody, stream, preparedCredentials);
+    recordRenamedToolNames(body, takeRenamedToolNames(requestBody));
+    const upstreamStream = transformedBody?.stream === true;
+    const headers = this.buildHeaders(preparedCredentials, upstreamStream, url, model);
+    const attempt = preparedCredentials[CONTRACT_ATTEMPT_FIELD];
+    const finalize = (result) => {
+      result.contractAttempt = attempt;
+      noteFreeTierOutcome(attempt, result.response.ok);
+      if (clientRequestedStream || !attempt) return result;
+      const response = rebuildJsonFromForcedStream(
+        result.response,
+        requestFormatForModel(model),
+        model,
+      );
+      return response === result.response ? result : { ...result, response };
+    };
+
+    const configuredFetcher = process.env.OPENCODE_FETCHER_PATH?.trim();
+    if (!configuredFetcher) {
+      const rawResponse = await proxyAwareFetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(transformedBody),
+        signal,
+      }, proxyOptions || null);
+      return finalize({ response: rawResponse, url, headers, transformedBody });
+    }
 
     const bunBin = process.env.BUN_BIN?.trim() || "bun";
     // ponytail: Next.js rewrites `import.meta.url` so the inlined path is
@@ -542,11 +588,18 @@ export class OpenCodeExecutor extends BaseExecutor {
       throw new Error(`opencode Bun fetcher: script not found. Tried: ${candidates.join(", ")}. Set OPENCODE_FETCHER_PATH or copy _opencode-fetcher.js into cli/app.`);
     }
 
+    // Hoisted so the child-process `close` handlers below can read it: `input`
+    // is the JSON *string* written to stdin, so `input.strictProxy` is always
+    // undefined and a guard on it would be dead code.
+    const strictProxy = proxyOptions?.strictProxy === true;
     const input = JSON.stringify({
       url,
       headers,
       body: JSON.stringify(transformedBody),
-      stream: !!stream,
+      stream: upstreamStream,
+      proxyUrl: proxyOptions?.connectionProxyEnabled ? proxyOptions.connectionProxyUrl : "",
+      strictProxy,
+      vercelRelayUrl: proxyOptions?.vercelRelayUrl || "",
     });
 
     const child = (await import("node:child_process")).spawn(bunBin, ["--cwd=/tmp", scriptPath], {
@@ -560,50 +613,72 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (signal) {
       const onAbort = () => { if (!child.killed) child.kill("SIGTERM"); };
       signal.addEventListener("abort", onAbort, { once: true });
-      child.on("exit", () => signal.removeEventListener?.("abort", onAbort));
+      child.on("close", () => signal.removeEventListener?.("abort", onAbort));
     }
 
     child.stdin.end(input);
 
-    if (stream) {
-      // ponytail: route the Bun subprocess stdout into a ReadableStream body
-      // the gateway can actually consume. The previous version wrote straight
-      // to process.stdout, which bypassed the gateway's SSE transform pipeline
-      // — so `response.completed` events never reached `extractUsage()` and
-      // every streaming request logged IN 0 / OUT 0 even when upstream
-      // emitted usage. Now the bytes flow through a ReadableStream and the
-      // chain picks up `input_tokens` / `output_tokens` as designed.
-      let headerBuf = Buffer.alloc(0);
-      let headerParsed = null;
-      const body = new ReadableStream({
-        start(controller) {
-          child.stdout.on("data", (chunk) => {
-            if (headerParsed) {
-              controller.enqueue(chunk);
-              return;
-            }
-            headerBuf = Buffer.concat([headerBuf, chunk]);
-            const nl = headerBuf.indexOf(0x0a);
-            if (nl < 0) return;
-            try {
-              headerParsed = JSON.parse(headerBuf.slice(0, nl).toString("utf8"));
-              const tail = headerBuf.slice(nl + 1);
+    if (upstreamStream) {
+      // Wait for the metadata line before constructing Response. Returning
+      // early would default every upstream error to HTTP 200 and turn its body
+      // into an apparently successful empty SSE stream.
+      return new Promise((resolve, reject) => {
+        let headerBuf = Buffer.alloc(0);
+        let controller = null;
+        let stderr = "";
+        let ended = false;
+
+        child.stdout.on("data", (chunk) => {
+          if (ended) return;
+          if (controller) {
+            controller.enqueue(chunk);
+            return;
+          }
+          headerBuf = Buffer.concat([headerBuf, chunk]);
+          const nl = headerBuf.indexOf(0x0a);
+          if (nl < 0) return;
+
+          let metadata;
+          try {
+            metadata = JSON.parse(headerBuf.slice(0, nl).toString("utf8"));
+          } catch (error) {
+            reject(new Error(`opencode Bun fetcher: bad metadata: ${error.message}`));
+            return;
+          }
+          const tail = headerBuf.slice(nl + 1);
+          const responseBody = new ReadableStream({
+            start(streamController) {
+              controller = streamController;
               if (tail.length) controller.enqueue(tail);
-            } catch {
-              return;
-            }
+            },
+            cancel() {
+              ended = true;
+              if (!child.killed) child.kill("SIGTERM");
+            },
           });
-          child.stderr.on("data", (chunk) => controller.enqueue(chunk));
-          child.on("error", (err) => controller.error(err));
-          child.on("exit", (code) => {
-            if (code !== 0) controller.error(new Error(`opencode Bun fetcher exit=${code}`));
-            else controller.close();
-          });
-        },
-      });
-      return Promise.resolve({
-        response: new Response(body, { status: headerParsed?.status || 200, headers: headerParsed?.headers || {} }),
-        url, headers, transformedBody,
+          resolve(finalize({
+            response: new Response(responseBody, { status: metadata.status, headers: metadata.headers || {} }),
+            url, headers, transformedBody,
+          }));
+        });
+        child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+        child.on("error", (error) => {
+          if (ended) return;
+          ended = true;
+          if (controller) controller.error(error);
+          else reject(error);
+        });
+        child.on("close", (code) => {
+          if (ended) return;
+          ended = true;
+          if (!controller) {
+            reject(new Error(`opencode Bun fetcher exited before metadata (exit=${code}) stderr=${stderr.slice(0, 500)}`));
+          } else if (code !== 0) {
+            controller.error(new Error(`opencode Bun fetcher exit=${code} stderr=${stderr.slice(0, 500)}`));
+          } else {
+            controller.close();
+          }
+        });
       });
     }
 
@@ -614,7 +689,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     child.stderr.on("data", (c) => stderrChunks.push(c));
     return new Promise((resolve, reject) => {
       child.on("error", reject);
-      child.on("exit", (code) => {
+      child.on("close", (code) => {
         const stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 500);
         if (code === 0) {
           let parsed;
@@ -623,29 +698,25 @@ export class OpenCodeExecutor extends BaseExecutor {
           } catch (e) {
             return reject(new Error(`opencode Bun fetcher: bad JSON output: ${e.message}`));
           }
-          // ponytail: Bun's response reached us but upstream returned an error
-          // (e.g. 429 FreeUsageLimitError, 503). Try the Node fallback before
-          // surfacing the error to the caller — Node's undici TLS is a
-          // separate rate-limit bucket on opencode's free-tier gate, so it
-          // often still works when Bun is rate-limited.
-          if (parsed.status >= 400 && parsed.status < 600) {
-            return tryNodeFallback({ resolve, reject, input, url, headers, transformedBody, bunStatus: parsed.status, bunBody: parsed.body });
-          }
-          return resolve({
+          return resolve(finalize({
             response: new Response(parsed.body, {
               status: parsed.status,
               headers: parsed.headers,
             }),
             url, headers, transformedBody,
-          });
+          }));
         }
         // ponytail: Bun hit a runtime error (TLS fingerprint rejection, rate-limit,
         // cwd issue). Fall back to a Node.js-native fetcher that uses undici's
         // TLS — different ClientHello signature from Bun, so the upstream
         // free-tier gate rate-limits them as separate buckets. When Bun is
         // burned (FreeUsageLimitError), Node often still works through a
-        // different code path on the same IP.
-        return tryNodeFallback({ resolve, reject, input, url, headers, transformedBody, bunCode: code, bunStderr: stderr });
+        // different code path on the same IP. A strict proxy request must not
+        // take this fallback because the Node child cannot guarantee proxy use.
+        if (strictProxy) {
+          return reject(new Error(`opencode Bun fetcher exit=${code} with strict proxy enabled`));
+        }
+        return tryNodeFallback({ resolve: (result) => resolve(finalize(result)), reject, input, url, headers, transformedBody, bunCode: code, bunStderr: stderr });
       });
     });
   }
@@ -676,7 +747,7 @@ async function tryNodeFallback({ resolve, reject, input, url, headers, transform
   nodeChild.stdout.on("data", (c) => out.push(c));
   nodeChild.stderr.on("data", (c) => err.push(c));
   nodeChild.on("error", () => reject(new Error(`node-fallback spawn error`)));
-  nodeChild.on("exit", (ncode) => {
+  nodeChild.on("close", (ncode) => {
     if (ncode !== 0) {
       return reject(new Error(`opencode node-fallback exit=${ncode} stderr=${Buffer.concat(err).toString("utf8").slice(0, 500)}`));
     }

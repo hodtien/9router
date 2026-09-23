@@ -4,6 +4,7 @@ import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLock
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, getProviderAlias, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
+import { isOpencodeFreeTierRefusalForProvider } from "open-sse/executors/opencodeGeoBlock.js";
 import * as log from "../utils/logger.js";
 
 /**
@@ -60,6 +61,16 @@ let selectionMutex = Promise.resolve();
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
+export function isOpencodeFreeTierRefusal(provider, status, errorText) {
+  let text;
+  try {
+    text = typeof errorText === "string" ? errorText : JSON.stringify(errorText);
+  } catch {
+    text = "";
+  }
+  return isOpencodeFreeTierRefusalForProvider(resolveProviderId(provider), status, text);
+}
+
 function githubMonthlyResetMs(status, errorText, provider) {
   if (resolveProviderId(provider) !== "github" || Number(status) !== 402) return null;
   if (!String(errorText || "").toLowerCase().includes(GITHUB_MONTHLY_USAGE_LIMIT)) return null;
@@ -106,6 +117,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
       return {
         id: "noauth",
+        connectionId: "noauth",
         connectionName: "Public",
         isActive: true,
         accessToken: "public",
@@ -114,6 +126,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           connectionProxyUrl: resolvedProxy.connectionProxyUrl,
           connectionNoProxy: resolvedProxy.connectionNoProxy,
           connectionProxyPoolId: resolvedProxy.proxyPoolId || null,
+          strictProxy: resolvedProxy.strictProxy === true,
           vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
         },
       };
@@ -264,6 +277,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         connectionProxyUrl: resolvedProxy.connectionProxyUrl,
         connectionNoProxy: resolvedProxy.connectionNoProxy,
         connectionProxyPoolId: resolvedProxy.proxyPoolId || null,
+        strictProxy: resolvedProxy.strictProxy === true,
         vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
       },
       connectionId: connection.id,
@@ -290,6 +304,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
  */
 export async function markAccountUnavailable(connectionId, status, errorText, provider = null, model = null, resetsAtMs = null) {
   if (!connectionId || connectionId === "noauth") return { shouldFallback: false, cooldownMs: 0 };
+
+  // ponytail: opencode free-tier refuses requests whose body / tools don't
+  // match the upstream contract (PR #14011 upstream). The refusal is scoped
+  // to the request, not the account — every sibling account answers the
+  // same request the same way, so a per-account lockout empties the pool.
+  // Skip the lock entirely and return the body unchanged.
+  if (isOpencodeFreeTierRefusal(provider, status, errorText)) {
+    log.warn("AUTH", `opencode free-tier refusal on ${connectionId.slice(0, 8)} [${status}] — no lockout`);
+    return { shouldFallback: false, cooldownMs: 0 };
+  }
+
   const connections = await getProviderConnections({ provider });
   const conn = connections.find(c => c.id === connectionId);
   const backoffLevel = conn?.backoffLevel || 0;
@@ -297,7 +322,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   // GitHub premium-request exhaustion is account-wide until the next UTC month.
   const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
 
-  // Provider-specific precise cooldown (e.g. codex usage_limit_reached resets_at) overrides backoff
+  // Provider-specific precise cooldown (e.g. codex usage_limit_exached resets_at) overrides backoff
   let shouldFallback, cooldownMs, newBackoffLevel;
   if (githubResetAtMs) {
     shouldFallback = true;
@@ -315,7 +340,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
-  const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
+  const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
   const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
 
   await updateProviderConnection(connectionId, {

@@ -63,6 +63,7 @@ describe("OpenCode Free Muse Spark thinking", () => {
     expect(out.max_tokens).toBeUndefined();
   });
 
+
   it("leaves the other free models on Chat Completions", () => {
     const executor = new OpenCodeExecutor();
     const body = { messages: [{ role: "user", content: "hi" }], max_tokens: 1024 };
@@ -131,5 +132,63 @@ describe("OpenCode Free Muse Spark thinking", () => {
       expect(out.max_output_tokens).toBe(2048);
       expect(out.max_tokens).toBeUndefined();
     }
+  });
+
+  it("strips prior-turn reasoning items carrying encrypted_content from input", () => {
+    const executor = new OpenCodeExecutor();
+    const model = "muse-spark-1.3-contributor-free";
+    const body = {
+      model,
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "say hi" }] },
+        {
+          type: "reasoning",
+          id: "rs_123",
+          encrypted_content: "ENC_BLOB_TURN_1",
+          summary: [{ type: "summary_text", text: "thinking text" }],
+        },
+        {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_1",
+          name: "shell",
+          arguments: JSON.stringify({ command: "echo hi" }),
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_1",
+          output: "hi",
+        },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "now say bye" }] },
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "shell",
+            description: "Run shell command",
+            parameters: { type: "object" },
+          },
+        },
+      ],
+    };
+
+    const out = executor.transformRequest(model, body, true, {});
+    expect(out.stream).toBe(true);
+    expect(out.store).toBe(false);
+    // Prior reasoning items stripped to prevent 400 "reasoning encrypted_content was not issued to this caller"
+    expect(out.input.some((item) => item.type === "reasoning")).toBe(false);
+    expect(JSON.stringify(out.input)).not.toContain("ENC_BLOB_TURN_1");
+    // User message, function_call, function_call_output, and next user message survive
+    const types = out.input.map((item) => item.type);
+    expect(types).toEqual(["message", "function_call", "function_call_output", "message"]);
+    // Tools flattened and empty properties added
+    expect(out.tools[0]).toEqual({
+      type: "function",
+      name: "shell",
+      description: "Run shell command",
+      parameters: { type: "object", properties: {} },
+    });
+    expect(out.tools.slice(1).map((tool) => tool.name)).toEqual(["bash", "glob", "grep", "read"]);
   });
 });
