@@ -47,6 +47,21 @@ import { ConfirmModal, EditConnectionModal } from "@/shared/components";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 
+const KIRO_METHOD_LABELS = {
+  "builder-id": "AWS Builder ID",
+  idc: "IAM Identity Center",
+  google: "Google",
+  github: "GitHub",
+  imported: "Imported Token",
+  api_key: "API Key",
+};
+
+function kiroMethodLabel(conn) {
+  const method = conn.providerSpecificData?.authMethod;
+  if (method && KIRO_METHOD_LABELS[method]) return KIRO_METHOD_LABELS[method];
+  return conn.authType === "api_key" ? "API Key" : "OAuth";
+}
+
 const AUTO_PING_SETTINGS_KEYS = {
   claude: "claudeAutoPing",
   codex: "codexAutoPing",
@@ -1111,6 +1126,11 @@ export default function ProviderLimits() {
                         {planLabel && (
                           <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
                             {planLabel}
+                          </span>
+                        )}
+                        {conn.provider === "kiro" && (
+                          <span className="rounded-full bg-brand-500/10 px-2 py-0.5 text-[10px] font-semibold text-brand-600 dark:text-brand-300">
+                            {kiroMethodLabel(conn)}
                           </span>
                         )}
                       </div>

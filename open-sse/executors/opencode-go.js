@@ -93,11 +93,9 @@ function sanitizeResponsesItems(body) {
   if (!Array.isArray(body.input)) return;
   body.input = body.input.filter((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return true;
-    // ponytail: strip prior-turn reasoning items. opencode uses pooled Console
-    // credentials that rotate across accounts; reasoning.encrypted_content can
-    // only be decrypted by the exact caller that issued it, so the item 400s
-    // "reasoning encrypted_content was not issued to this caller". Under
-    // store=false the missing blob also 400s as "not found or was deleted".
+    // Strip prior-turn reasoning items: pooled Console credentials and sessions
+    // cannot validate reasoning.encrypted_content from a different caller. With
+    // store=false, missing blobs are also rejected as not found or deleted.
     if (item.type === "reasoning") return false;
     delete item.encrypted_content;
     delete item.reasoning_encrypted_content;
