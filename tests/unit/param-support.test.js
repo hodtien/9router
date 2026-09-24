@@ -1,6 +1,16 @@
 import { describe, it, expect } from "vitest";
 
-import { stripUnsupportedParams } from "../../open-sse/translator/concerns/paramSupport.js";
+import { enforceParamMinimums, stripUnsupportedParams } from "../../open-sse/translator/concerns/paramSupport.js";
+
+describe("enforceParamMinimums", () => {
+  it("raises Qwen3.8 token limits below the upstream minimum", () => {
+    const body = { max_tokens: 1, max_completion_tokens: 2, max_output_tokens: 0 };
+
+    enforceParamMinimums("openai-compatible-chat", "qwen3.8-32b", body);
+
+    expect(body).toEqual({ max_tokens: 3, max_completion_tokens: 3, max_output_tokens: 3 });
+  });
+});
 
 describe("stripUnsupportedParams", () => {
   it("flattens Cloudflare AI OpenAI content-part arrays", () => {
