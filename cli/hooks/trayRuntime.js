@@ -5,10 +5,20 @@
 //
 // We use the maintained `systray2` fork. The original `systray@1.0.5` package
 // bundles a 2017 x86_64 Go binary whose Mach-O headers are rejected by modern
-// dyld (macOS 14+), so the tray silently fails to register on Apple Silicon.
+// dyld (macOS 14+), so it fails to load at all.
+//
+// Note that systray2 is NOT an Apple Silicon fix: like its predecessor it ships
+// only an x86_64 `tray_darwin_release`, and picks it by process.platform with no
+// process.arch branch, so there is no native slice to select. On arm64 macOS the
+// tray therefore needs Rosetta 2 and dies with EBADARCH without it. We overlay
+// our own arm64 build of the same upstream source on top — see ensureArm64TrayBin.
+const { spawnSync } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const {
+  getRuntimeDir,
   getRuntimeNodeModules,
   installRuntimePackages,
 } = require("./runtimeInstall");
@@ -16,6 +26,19 @@ const {
 const SYSTRAY_PKG = "systray2";
 const SYSTRAY_VERSION = "2.1.4";
 const LEGACY_SYSTRAY_PKG = "systray";
+
+// Pinned `tray-binaries` release rather than `latest`, so the URL is stable and
+// the artifact can only change by a deliberate re-upload. The workflow's publish
+// step re-derives this repo from the literal below and refuses to upload
+// anywhere else, so the integrity gate can't drift from what clients fetch.
+//
+// The asset is built by .github/workflows/tray-binaries.yml on a macos-15 runner.
+// cgo compiles AppKit against the runner's SDK, so this value tracks that image:
+// when GitHub updates it the sha changes, the workflow refuses to publish, and
+// this constant must be bumped in the same change as the re-upload.
+const ARM64_TRAY_URL = "https://github.com/decolua/9router/releases/download/tray-binaries/tray_darwin_arm64";
+const ARM64_TRAY_SHA256 = "487e3c365aaa1eb6ad295bf3989711e975b52cee07505bf641c8559954881c81";
+const ARM64_RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 function hasSystray() {
   return fs.existsSync(path.join(getRuntimeNodeModules(), SYSTRAY_PKG, "package.json"));
@@ -59,6 +82,96 @@ function chmodSystrayBin({ silent = false } = {}) {
   }
 }
 
+// A thin (non-fat) 64-bit Mach-O stores its magic then cputype, both LE.
+// CPU_TYPE_ARM64 is CPU_TYPE_ARM | CPU_ARCH_ABI64. Fat/universal binaries use a
+// different magic and are reported as "not arm64" here, which is fine: we only
+// ever overlay a thin arm64 build and only need to tell it apart from x86_64.
+function isArm64MachO(file) {
+  let fd = null;
+  try {
+    fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(8);
+    fs.readSync(fd, buf, 0, 8, 0);
+    if (buf.readUInt32LE(0) !== 0xfeedfacf) return false;
+    return buf.readUInt32LE(4) === 0x0100000c;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) try { fs.closeSync(fd); } catch {}
+  }
+}
+
+function bustSystrayCopyCache() {
+  try {
+    fs.rmSync(path.join(os.homedir(), ".cache", "node-systray", SYSTRAY_VERSION), { recursive: true, force: true });
+  } catch {}
+}
+
+function arm64AttemptMarker() {
+  return path.join(getRuntimeDir(), ".tray-arm64-attempt");
+}
+
+function recentlyAttemptedArm64() {
+  try {
+    const at = Number(fs.readFileSync(arm64AttemptMarker(), "utf8").trim());
+    return Number.isFinite(at) && Date.now() - at < ARM64_RETRY_COOLDOWN_MS;
+  } catch {
+    return false;
+  }
+}
+
+function markArm64Attempt() {
+  try { fs.writeFileSync(arm64AttemptMarker(), String(Date.now())); } catch {}
+}
+
+function clearArm64Attempt() {
+  try { fs.rmSync(arm64AttemptMarker(), { force: true }); } catch {}
+}
+
+function downloadFile(url, dest, timeoutSec) {
+  const res = spawnSync("curl", ["-fsSL", "--max-time", String(timeoutSec), "-o", dest, url], {
+    encoding: "utf8",
+    timeout: (timeoutSec + 5) * 1000
+  });
+  if (res.status === 0 && fs.existsSync(dest)) return;
+  const detail = (res.stderr || res.error?.message || `curl exit ${res.status}`).trim().split("\n").pop();
+  throw new Error(detail || "download failed");
+}
+
+function sha256File(file) {
+  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function ensureArm64TrayBin() {
+  if (process.platform !== "darwin" || process.arch !== "arm64") return { skipped: true };
+
+  const binPath = path.join(getRuntimeNodeModules(), SYSTRAY_PKG, "traybin", "tray_darwin_release");
+  if (!fs.existsSync(binPath)) return { skipped: true };
+  if (isArm64MachO(binPath)) return { native: true };
+  if (recentlyAttemptedArm64()) return { deferred: true };
+
+  markArm64Attempt();
+  console.log("⏳ Downloading native Apple Silicon tray binary...");
+  const tmp = `${binPath}.arm64.${process.pid}.tmp`;
+  try {
+    downloadFile(ARM64_TRAY_URL, tmp, 30);
+    const sum = sha256File(tmp);
+    if (sum !== ARM64_TRAY_SHA256) throw new Error(`checksum mismatch (got ${sum.slice(0, 12)}…)`);
+    if (!isArm64MachO(tmp)) throw new Error("downloaded file is not an arm64 Mach-O");
+    fs.chmodSync(tmp, 0o755);
+    fs.renameSync(tmp, binPath);
+    bustSystrayCopyCache();
+    clearArm64Attempt();
+    console.log("✅ Native Apple Silicon tray installed");
+    return { native: true, installed: true };
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    console.warn("⚠️  Native tray download failed — falling back to the Intel binary");
+    console.warn(`   Reason: ${e.message}`);
+    console.warn("   The Intel tray needs Rosetta 2: softwareupdate --install-rosetta --agree-to-license");
+    return { native: false, error: e.message };
+  }
+}
 // Public: ensure systray2 is installed on macOS/Linux only.
 // Windows skips entirely (uses PowerShell tray).
 function ensureTrayRuntime({ silent = false } = {}) {
@@ -69,20 +182,25 @@ function ensureTrayRuntime({ silent = false } = {}) {
   if (process.platform === "win32") {
     return { systray: false, skipped: true };
   }
-  if (hasSystray()) {
+
+  let ready = hasSystray();
+  if (!ready) {
+    const ok = installRuntimePackages([`${SYSTRAY_PKG}@${SYSTRAY_VERSION}`], {
+      silent,
+      timeout: 120000,
+      label: "system tray",
+      failureTitle: "System tray install failed — tray disabled",
+      failureHint: "tray disabled",
+    });
+    ready = ok && hasSystray();
+  }
+  if (ready) {
     chmodSystrayBin({ silent });
     if (!silent) console.log("✅ System tray ready");
-    return { systray: true };
   }
-  const ok = installRuntimePackages([`${SYSTRAY_PKG}@${SYSTRAY_VERSION}`], {
-    silent,
-    timeout: 120000,
-    label: "system tray",
-    failureTitle: "System tray install failed — tray disabled",
-    failureHint: "tray disabled",
-  });
-  if (ok) chmodSystrayBin({ silent });
-  return { systray: ok && hasSystray() };
+
+  const arm64 = ready ? ensureArm64TrayBin() : { skipped: true };
+  return { systray: ready, arm64 };
 }
 
-module.exports = { ensureTrayRuntime };
+module.exports = { ensureTrayRuntime, ensureArm64TrayBin };
