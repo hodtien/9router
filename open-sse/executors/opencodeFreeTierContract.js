@@ -46,7 +46,7 @@ export function requiresFreeTierRequestContract(surface, provider, model) {
 
 function parseToolNames(value) {
   const kept = [];
-  for (const part of (value || "").split(",")) {
+  for (const part of String(value || "").split(",")) {
     const name = part.trim();
     if (kept.length >= 32) break;
     if (!NAME_PATTERN.test(name)) continue;
@@ -56,11 +56,11 @@ function parseToolNames(value) {
 }
 
 export function configuredPlaceholderToolNames() {
-  return parseToolNames(process.env.OPENCODE_FREE_TIER_PLACEHOLDER_TOOLS || "");
+  return parseToolNames(process.env.OPENCODE_FREE_TIER_PLACEHOLDER_TOOLS);
 }
 
 export function recoveryToolNames() {
-  const configured = parseToolNames(process.env.OPENCODE_FREE_TIER_RECOVERY_TOOLS || "");
+  const configured = parseToolNames(process.env.OPENCODE_FREE_TIER_RECOVERY_TOOLS);
   return configured.length > 0 ? configured : [...DEFAULT_RECOVERY_TOOL_NAMES];
 }
 
@@ -68,40 +68,28 @@ function hasTools(body) {
   return Array.isArray(body.tools) && body.tools.length > 0;
 }
 
-function buildTools(names, requestFormat) {
-  if (requestFormat === "openai-responses") {
-    return names.map((name) => ({
-      type: "function", name,
-      description: PLACEHOLDER_TOOL_DESCRIPTION,
-      parameters: PLACEHOLDER_TOOL_PARAMETERS,
-    }));
-  }
-  return names.map((name) => ({
-    type: "function",
-    function: { name, description: PLACEHOLDER_TOOL_DESCRIPTION, parameters: PLACEHOLDER_TOOL_PARAMETERS },
-  }));
-}
-
 export function applyFreeTierRequestContract(body, requestFormat, placeholderNames = [PLACEHOLDER_TOOL_NAME]) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const next = { ...body, stream: true };
   if (hasTools(next)) return next;
   const names = placeholderNames.length > 0 ? placeholderNames : [PLACEHOLDER_TOOL_NAME];
-  if (requestFormat === "openai-responses" || requestFormat === "openai" || requestFormat === null) {
-    next.tools = buildTools(names, requestFormat);
+  if (requestFormat === "openai-responses") {
+    next.tools = names.map((name) => ({
+      type: "function",
+      name,
+      description: PLACEHOLDER_TOOL_DESCRIPTION,
+      parameters: PLACEHOLDER_TOOL_PARAMETERS,
+    }));
+  } else if (requestFormat === "openai" || requestFormat === null) {
+    next.tools = names.map((name) => ({
+      type: "function",
+      function: {
+        name,
+        description: PLACEHOLDER_TOOL_DESCRIPTION,
+        parameters: PLACEHOLDER_TOOL_PARAMETERS,
+      },
+    }));
   }
-  return next;
-}
-
-export function applyFreeTierRecoveryContract(body, requestFormat) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
-  const next = { ...body, stream: true };
-  const callerTools = hasTools(next)
-    ? next.tools.filter((tool) => clientToolNamesOf({ tools: [tool] })[0] !== PLACEHOLDER_TOOL_NAME)
-    : [];
-  const callerNames = new Set(clientToolNamesOf({ tools: callerTools }));
-  const recoveryNames = recoveryToolNames().filter((name) => !callerNames.has(name));
-  next.tools = [...callerTools, ...buildTools(recoveryNames, requestFormat)];
   return next;
 }
 
@@ -114,6 +102,42 @@ function clientToolNamesOf(body) {
     if (typeof name === "string") names.push(name);
   }
   return names;
+}
+
+function buildRecoveryTools(names, requestFormat) {
+  if (requestFormat === "openai-responses") {
+    return names.map((name) => ({
+      type: "function",
+      name,
+      description: PLACEHOLDER_TOOL_DESCRIPTION,
+      parameters: PLACEHOLDER_TOOL_PARAMETERS,
+    }));
+  }
+  return names.map((name) => ({
+    type: "function",
+    function: {
+      name,
+      description: PLACEHOLDER_TOOL_DESCRIPTION,
+      parameters: PLACEHOLDER_TOOL_PARAMETERS,
+    },
+  }));
+}
+
+export function applyFreeTierRecoveryContract(body, requestFormat) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const next = { ...body, stream: true };
+  const callerTools = hasTools(next)
+    ? next.tools.filter((tool) => {
+      const name = typeof tool?.name === "string" ? tool.name : tool?.function?.name;
+      return name !== "_noop";
+    })
+    : [];
+  const recovery = buildRecoveryTools(recoveryToolNames(), requestFormat);
+  next.tools = [...callerTools, ...recovery.filter((tool) => {
+    const name = tool.name || tool.function?.name;
+    return !callerTools.some((caller) => (caller.name || caller.function?.name) === name);
+  })];
+  return next;
 }
 
 export function prepareFreeTierRequest(body, requestFormat, surface, provider, model, session) {
