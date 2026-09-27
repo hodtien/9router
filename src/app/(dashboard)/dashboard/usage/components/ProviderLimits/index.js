@@ -44,7 +44,7 @@ import {
 } from "./utils";
 import Card from "@/shared/components/Card";
 import { ConfirmModal, EditConnectionModal } from "@/shared/components";
-import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
+import { USAGE_SUPPORTED_PROVIDERS, AI_PROVIDERS } from "@/shared/constants/providers";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 
 const KIRO_METHOD_LABELS = {
@@ -121,6 +121,11 @@ function claudeGrantStatus(grant) {
   if (grant.startsAt && new Date(grant.startsAt).getTime() > Date.now()) return "not started";
   return grant.useRequiresLimit ? "at limit only" : "unavailable";
 }
+
+function providerLabel(providerId) {
+  return AI_PROVIDERS[providerId]?.name || providerId;
+}
+
 function formatCreditDate(value) {
   if (!value) return "N/A";
   const date = new Date(value);
@@ -817,7 +822,7 @@ export default function ProviderLimits() {
   };
 
   const selectedProviderLabel =
-    providerFilter === "all" ? "All providers" : providerFilter;
+    providerFilter === "all" ? "All providers" : providerLabel(providerFilter);
   const hasEligibleConnections = totals.eligibleConnections > 0;
   const hasVisibleConnections = sortedConnections.length > 0;
   const emptyState = getConnectionsEmptyMessage(
@@ -894,7 +899,7 @@ export default function ProviderLimits() {
                     fallbackText={providerFilter.slice(0, 2).toUpperCase()}
                   />
                 )}
-                <span className="truncate capitalize hidden lg:inline">
+                <span className="truncate hidden lg:inline">
                   {selectedProviderLabel}
                 </span>
               </span>
@@ -955,8 +960,8 @@ export default function ProviderLimits() {
                           className="size-6 rounded-md object-contain"
                           fallbackText={provider.slice(0, 2).toUpperCase()}
                         />
-                        <span className="font-medium capitalize">
-                          {provider}
+                        <span className="font-medium">
+                          {providerLabel(provider)}
                         </span>
                         {providerFilter === provider && (
                           <span className="material-symbols-outlined ml-auto text-[20px]">
