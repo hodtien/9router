@@ -274,10 +274,6 @@ describe("OpenCode free-tier request contract and Responses normalization", () =
     expect(Array.isArray(out.tools)).toBe(true);
   });
 
-  it("does not force every OpenCode request to stream at provider scope", async () => {
-    const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS.opencode?.forceStream).not.toBe(true);
-  });
 });
 
 describe("opencodeFingerprint — request side", () => {

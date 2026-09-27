@@ -1,11 +1,41 @@
-import { describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PROVIDERS } from "../../open-sse/config/providers.js";
-import { OpenCodeExecutor } from "../../open-sse/executors/opencode.js";
-import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
 
-vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
-  proxyAwareFetch: vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => "" } })),
+const { spawnMock } = vi.hoisted(() => ({
+  spawnMock: vi.fn(),
 }));
+
+vi.mock("node:child_process", () => ({
+  spawn: spawnMock,
+}));
+
+const { OpenCodeExecutor } = await import("../../open-sse/executors/opencode.js");
+
+function makeChild(inputs) {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.killed = false;
+  child.kill = vi.fn(() => { child.killed = true; });
+  child.stdin = {
+    end: vi.fn((input) => {
+      inputs.push(JSON.parse(input));
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from(
+          `${JSON.stringify({ status: 200, headers: { "content-type": "text/event-stream" } })}\ndata: [DONE]\n\n`,
+        ));
+        child.emit("close", 0);
+      });
+    }),
+  };
+  return child;
+}
+
+afterEach(() => {
+  delete process.env.OPENCODE_FETCHER_PATH;
+  spawnMock.mockReset();
+});
 
 // Break caught: opencode/muse-spark-1.3-contributor-free 400 vì upstream
 // chỉ nhận tool_choice "auto"; named/required/none phải demote sang "auto".
@@ -69,8 +99,10 @@ describe("opencode Free 1.3 tool_choice auto-only", () => {
     expect(out.tool_choice).toEqual(choice);
   });
 
-  it("wire: execute gửi choice auto tới /zen/v1/responses", async () => {
-    proxyAwareFetch.mockClear();
+  it("wire: execute sends choice auto through the Bun fetcher", async () => {
+    const inputs = [];
+    spawnMock.mockReturnValue(makeChild(inputs));
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
     const ex = new OpenCodeExecutor();
     const body = responsesBody(FREE_13, { type: "function", name: "get_weather" });
     const { url, transformedBody } = await ex.execute({
@@ -78,10 +110,11 @@ describe("opencode Free 1.3 tool_choice auto-only", () => {
     });
     expect(url).toBe("https://opencode.ai/zen/v1/responses");
     expect(transformedBody.tool_choice).toBe("auto");
-    expect(proxyAwareFetch).toHaveBeenCalledTimes(1);
-    const [actualUrl, actualInit] = proxyAwareFetch.mock.calls[0];
-    expect(actualUrl).toBe("https://opencode.ai/zen/v1/responses");
-    const sent = JSON.parse(actualInit.body);
+    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].url).toBe("https://opencode.ai/zen/v1/responses");
+    expect(inputs[0].headers.Accept).toBe("text/event-stream");
+    const sent = JSON.parse(inputs[0].body);
     expect(sent.tool_choice).toBe("auto");
     expect(sent.model).toBe(FREE_13);
     expect(sent.tools).toEqual(TOOLS);

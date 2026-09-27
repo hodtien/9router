@@ -1,12 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const { fetchMock } = vi.hoisted(() => ({
-  fetchMock: vi.fn(),
-}));
-
-vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
-  proxyAwareFetch: fetchMock,
-}));
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { getExecutor } from "../../open-sse/executors/index.js";
 import {
@@ -37,14 +29,6 @@ function prepare(executor, overrides = {}) {
   });
   return { credentials, prepared };
 }
-
-beforeEach(() => {
-  fetchMock.mockReset();
-  fetchMock.mockResolvedValue(new Response("{}", {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  }));
-});
 
 describe("OpenCode Free Session ID Format", () => {
   it("generates session IDs matching OpenCode canonical format (ses_ + 12 hex + 14 base62)", () => {
@@ -137,22 +121,24 @@ describe("OpenCode Free Executor Session Resolution", () => {
     expect(toolClaude).not.toBe(toolCodex);
   });
 
-  it("adds the valid session header to fetch requests", async () => {
+  it("adds the valid session header to request headers", () => {
     const executor = getExecutor("opencode");
     const credentials = makeCredentials();
-    const result = await executor.execute({
-      model: "muse-spark-1.3-contributor-free",
+    const prepared = executor.prepareRequestCredentials({
       body: { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }] },
-      stream: false,
       credentials,
       providerSessionId: "conversation-fetch-test",
       clientTool: "claude",
     });
+    const headers = executor.buildHeaders(
+      prepared,
+      true,
+      "https://opencode.ai/zen/v1/responses",
+      "muse-spark-1.3-contributor-free",
+    );
 
-    expect(result.headers["x-opencode-session"]).toMatch(OPENCODE_SESSION_RE);
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0][1].headers["x-opencode-session"]).toBe(result.headers["x-opencode-session"]);
-    expect(fetchMock.mock.calls[0][1].headers["Authorization"]).toBe("Bearer public");
+    expect(headers["x-opencode-session"]).toMatch(OPENCODE_SESSION_RE);
+    expect(headers["Authorization"]).toBe("Bearer public");
     expect(credentials).not.toHaveProperty("_opencodeSession");
   });
 
@@ -277,68 +263,44 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(second).toBe(first);
   });
 
-  it("applies the full lowercase free-tier fingerprint quartet", () => {
-  const executor = getExecutor("opencode");
-
-  const chatNoTools = executor.transformRequest("nemotron-3-ultra-free", {
-    messages: [{ role: "user", content: "hi" }],
-  });
-  expect(chatNoTools.stream).toBe(true);
-  expect(chatNoTools.tool_choice).toBe("none");
-  expect(chatNoTools.tools.map((t) => t.function?.name)).toEqual([
-    "bash", "glob", "grep", "read",
-  ]);
-
-  const chatWithTools = executor.transformRequest("nemotron-3-ultra-free", {
-    messages: [{ role: "user", content: "hi" }],
-    tools: [
-      { type: "function", function: { name: "Bash", description: "Claude Code tool" } },
-      { type: "function", function: { name: "Glob", description: "Claude Code tool" } },
-      { type: "function", function: { name: "Grep", description: "Claude Code tool" } },
-      { type: "function", function: { name: "Read", description: "Claude Code tool" } },
-    ],
-    tool_choice: "auto",
-  });
-  expect(chatWithTools.tool_choice).toBe("auto");
-  expect(chatWithTools.tools.map((t) => t.function?.name)).toEqual([
-    "bash", "glob", "grep", "read",
-  ]);
-
-  const chatPartial = executor.transformRequest("nemotron-3-ultra-free", {
-    messages: [{ role: "user", content: "hi" }],
-    tools: [
-      { type: "function", function: { name: "bash", description: "existing" } },
-      { type: "function", function: { name: "read", description: "existing" } },
-    ],
-  });
-  expect(chatPartial.tools.map((t) => t.function?.name)).toEqual([
-    "bash", "read", "glob", "grep",
-  ]);
-  expect(chatPartial.tools[0].function.description).toBe("existing");
-});
-
-  it("cloaks Muse Responses requests even when the client already supplies tools", () => {
+  it("applies the free-tier placeholder and preserves caller tools", () => {
     const executor = getExecutor("opencode");
+
+    const chatNoTools = executor.transformRequest("mimo-v2.5-free", {
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(chatNoTools.stream).toBe(true);
+    expect(chatNoTools.tools.map((tool) => tool.function?.name)).toEqual(["_noop"]);
+
+    const callerTool = {
+      type: "function",
+      function: { name: "lookup", description: "caller tool" },
+    };
+    const chatWithTools = executor.transformRequest("mimo-v2.5-free", {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [callerTool],
+    });
+    expect(chatWithTools.tools).toEqual([callerTool]);
+  });
+
+  it("preserves caller tools on Muse Responses requests", () => {
+    const executor = getExecutor("opencode");
+    const callerTool = {
+      type: "function",
+      name: "zcode_search",
+      description: "client-provided tool",
+      parameters: { type: "object", properties: {} },
+    };
     const transformed = executor.transformRequest("muse-spark-1.3-contributor-free(xhigh)", {
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
-      tools: [{
-        type: "function",
-        name: "zcode_search",
-        description: "client-provided tool",
-        parameters: { type: "object", properties: {} },
-      }],
+      tools: [callerTool],
       tool_choice: "auto",
       reasoning_effort: "xhigh",
     }, true, {});
 
     expect(transformed.stream).toBe(true);
     expect(transformed.reasoning?.effort).toBe("xhigh");
-    const names = transformed.tools.map((tool) => tool.name);
-    expect(names).toContain("zcode_search");
-    expect(names).toContain("bash");
-    expect(names).toContain("read");
-    expect(names.filter((name) => name === "bash")).toHaveLength(1);
-    expect(names.filter((name) => name === "read")).toHaveLength(1);
+    expect(transformed.tools).toEqual([callerTool]);
   });
 
   it("declares forceStream on the opencode transport so chatCore serves SSE upstream", async () => {
