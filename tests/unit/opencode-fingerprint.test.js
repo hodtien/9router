@@ -316,9 +316,9 @@ describe("OpenCode free-tier request contract and Responses normalization", () =
     expect(paid.stream).toBe(false);
   });
 
-  it("does not declare provider-wide streaming", async () => {
+  it("declares provider-wide streaming", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS.opencode?.forceStream).toBeUndefined();
+    expect(PROVIDERS.opencode?.forceStream).toBe(true);
   });
 });
 
@@ -502,12 +502,17 @@ describe("fingerprintToolKey", () => {
     expect(fingerprintToolKey(null)).toBe("");
   });
 
-  it("does not automatically retry a classified free-tier 429", async () => {
+  it("retries a classified free-tier 429 with fresh session and request ids", async () => {
     fetchMock.mockClear();
-    fetchMock.mockResolvedValue(new Response(JSON.stringify({ type: "FreeUsageLimitError" }), {
-      status: 429,
-      headers: { "content-type": "application/json" },
-    }));
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ type: "FreeUsageLimitError" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response("{}", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
     const result = await new OpenCodeExecutor().execute({
       model: "big-pickle",
       body: { messages: [{ role: "user", content: "hi" }] },
@@ -515,8 +520,12 @@ describe("fingerprintToolKey", () => {
       credentials: makeCredentials(),
     });
 
-    expect(result.response.status).toBe(429);
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(result.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][1].headers["x-opencode-session"])
+      .not.toBe(fetchMock.mock.calls[0][1].headers["x-opencode-session"]);
+    expect(fetchMock.mock.calls[1][1].headers["x-opencode-request"])
+      .not.toBe(fetchMock.mock.calls[0][1].headers["x-opencode-request"]);
   });
 
   it("records caller tool-name restoration on the executor request body", async () => {

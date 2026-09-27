@@ -1152,7 +1152,7 @@ export default function ProviderLimits() {
                     <div className="min-w-0">
                       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                         <h3 className="text-xs font-semibold text-text-primary capitalize truncate">
-                          {conn.provider}
+                          {providerLabel(conn.provider)}
                         </h3>
                         <span className="rounded-full bg-brand-500/10 px-2 py-0.5 text-[10px] font-semibold text-brand-600 dark:text-brand-300">
                           {getAccountTypeLabel(conn)}

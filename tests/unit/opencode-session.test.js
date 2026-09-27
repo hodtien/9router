@@ -341,8 +341,8 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(names.filter((name) => name === "read")).toHaveLength(1);
   });
 
-  it("does not declare provider-wide forceStream", async () => {
+  it("declares provider-wide forceStream for OpenCode", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS.opencode?.forceStream).toBeUndefined();
+    expect(PROVIDERS.opencode?.forceStream).toBe(true);
   });
 });
