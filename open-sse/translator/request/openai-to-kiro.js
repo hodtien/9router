@@ -20,6 +20,7 @@ import {
 import { parseDataUri } from "../concerns/image.js";
 import { DEFAULT_IMAGE_MIME } from "../schema/index.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
+import { extractForwardableSystemContent } from "../concerns/claudeCodeSystem.js";
 import {
   canonicalizeKiroConversation,
   normalizeKiroToolSpecs,
@@ -108,7 +109,9 @@ function convertMessages(messages, model) {
     if (role === ROLE.USER) {
       // Extract content
       let content = "";
-      if (typeof msg.content === "string") {
+      if (msg.role === ROLE.SYSTEM) {
+        content = extractForwardableSystemContent(msg.content);
+      } else if (typeof msg.content === "string") {
         content = msg.content;
       } else if (Array.isArray(msg.content)) {
         const textParts = [];

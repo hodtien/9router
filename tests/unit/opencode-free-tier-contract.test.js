@@ -15,9 +15,7 @@ import {
 } from "../../open-sse/executors/opencodeToolObservation.js";
 import { OpenCodeExecutor } from "../../open-sse/executors/opencode.js";
 import "../translator/registerAll.js";
-import { translateRequest } from "../../open-sse/translator/index.js";
 import { getModelTargetFormat } from "../../open-sse/config/providerModels.js";
-import { FORMATS } from "../../open-sse/translator/formats.js";
 
 const chatBody = () => ({ model: "mimo-v2.5-free", messages: [{ role: "user", content: "hi" }] });
 
@@ -182,30 +180,8 @@ describe("OpenCode free-tier request contract", () => {
     expect(out.tool_choice).toBe(choice);
   });
 
-  it("routes union-alpha through the registered Claude Messages transport", () => {
-    const executor = new OpenCodeExecutor();
-    const target = getModelTargetFormat("oc", "union-alpha");
-    const translated = translateRequest(
-      FORMATS.OPENAI,
-      target,
-      "union-alpha",
-      {
-        messages: [{ role: "user", content: "hi" }],
-        tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object", properties: {} } } }],
-      },
-      true,
-      {},
-      "opencode",
-    );
-    const out = executor.transformRequest("union-alpha", translated, true, {});
-
-    expect(target).toBe(FORMATS.CLAUDE);
-    expect(executor.buildUrl("union-alpha")).toBe("https://opencode.ai/zen/v1/messages");
-    expect(executor.buildHeaders({}, true, "https://opencode.ai/zen/v1/messages", "union-alpha")["anthropic-version"]).toBe("2023-06-01");
-    expect(out.tools[0]).toMatchObject({ name: "lookup", input_schema: { type: "object" } });
-    expect(out.tools[0]).not.toHaveProperty("function");
-    expect(out.messages[0]).toMatchObject({ role: "user", content: [{ type: "text", text: "hi" }] });
-    expect(out.stream).toBe(true);
+  it("does not register retired union-alpha as an OpenCode model", () => {
+    expect(getModelTargetFormat("oc", "union-alpha")).toBeNull();
   });
 
   it("uses JSON transport headers for a paid non-streaming request", () => {
@@ -232,9 +208,9 @@ describe("OpenCode free-tier request contract", () => {
     expect(out).not.toHaveProperty("tools");
   });
 
-  it("does not declare provider-wide streaming", async () => {
+  it("declares provider-wide streaming for the free-tier transport", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS.opencode?.forceStream).toBeUndefined();
+    expect(PROVIDERS.opencode?.forceStream).toBe(true);
   });
 
   it("preserves the complete Responses terminal payload", async () => {
