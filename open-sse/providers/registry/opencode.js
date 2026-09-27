@@ -17,17 +17,29 @@ export default {
     headers: {
       "x-opencode-client": "desktop",
     },
+    forceStream: true,
     noAuth: true,
+    quirks: {
+      forceAutoToolChoiceModels: ["muse-spark-1.3-contributor-free"],
+    },
   },
   models: [
-    // Muse Spark models are served by /zen/v1/responses; the rest stay on
-    // /chat/completions, so the format is declared per-model, not per-provider.
+    // Endpoint formats differ per model, so declare non-chat models explicitly.
     { id: "muse-spark-1.2-contributor-free", name: "Muse Spark 1.2 Contributor Free", targetFormat: "openai-responses" },
     { id: "muse-spark-1.3-contributor-free", name: "Muse Spark 1.3 Contributor Free", targetFormat: "openai-responses" },
     // union-alpha removed 2026-09-19: Zen returns 401 "Model not supported"
     // for this id; upstream OpenCode retired it. Re-add only if Zen brings
     // it back under a confirmed free-tier contract.
+    { id: "jev-1.13-free", name: "Jev 1.13 Free", kind: "systemone" },
   ],
+  serviceKinds: ["llm", "systemone"],
+  systemoneConfig: {
+    baseUrl: "https://opencode.ai/zen/v1/systemone",
+    headers: {
+      "x-opencode-client": "desktop",
+      "User-Agent": "opencode/1.18.31",
+    },
+  },
   modelsFetcher: { url: "https://opencode.ai/zen/v1/models", type: "opencode-free" },
   passthroughModels: true,
 };
