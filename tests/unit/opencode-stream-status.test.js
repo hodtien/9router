@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { _resetToolObservationForTests, getObservedToolNames } from "../../open-sse/executors/opencodeToolObservation.js";
+import { recoveryToolNames } from "../../open-sse/executors/opencodeFreeTierContract.js";
 
 const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
@@ -167,64 +168,62 @@ describe("OpenCode streaming transport status", () => {
     expect(spawns).toBe(1);
   });
 
-  it("does not retry a borrowed-placeholder FreeTier refusal", async () => {
+  it("retries a borrowed-placeholder FreeTier refusal once with the recovery pack", async () => {
     const inputs = [];
     const refusal = JSON.stringify({ type: "FreeTierError", message: "free tier can only be used within OpenCode" });
-    mocks.spawn.mockReturnValue(makeChild(403, refusal, { "content-type": "application/json" }, inputs));
+    const children = [
+      makeChild(403, refusal, { "content-type": "application/json" }, inputs),
+      makeChild(200, "data: ok\\n\\n", { "content-type": "text/event-stream" }, inputs),
+    ];
+    mocks.spawn.mockImplementation(() => children.shift());
     process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
     const result = await new OpenCodeExecutor().execute({
       model: "muse-spark-1.3-contributor-free", body: { input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }] },
       stream: true, credentials: {},
     });
-    expect(mocks.spawn).toHaveBeenCalledOnce();
-    expect(JSON.parse(inputs[0].body).tools.map((tool) => tool.name)).toEqual([
-      "_noop", "bash", "glob", "grep", "read",
-    ]);
-    expect(result.response.status).toBe(403);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    const recoveryTools = JSON.parse(inputs[1].body).tools.map((tool) => tool.name);
+    expect(recoveryTools).toHaveLength(recoveryToolNames().length);
+    expect(recoveryTools).toEqual(expect.arrayContaining(recoveryToolNames()));
+    expect(inputs[1].headers["x-opencode-session"]).not.toBe(inputs[0].headers["x-opencode-session"]);
+    expect(await result.response.text()).toBe("data: ok\\n\\n");
   });
 
-  it("does not retry a classified OpenCode 429", async () => {
-    const inputs = [];
-    const rateLimit = JSON.stringify({ type: "FreeUsageLimitError", message: "rate limit exceeded" });
-    mocks.spawn.mockReturnValue(makeChild(429, rateLimit, { "content-type": "application/json" }, inputs));
-    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
-    const result = await new OpenCodeExecutor().execute({
-      model: "muse-spark-1.3-contributor-free",
-      body: { input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }] },
-      stream: true,
-      credentials: {},
-    });
-    expect(mocks.spawn).toHaveBeenCalledOnce();
-    expect(result.response.status).toBe(429);
-  });
-
-  it("does not retry an invalid-session FreeTier refusal", async () => {
+  it("refreshes an invalid caller session during recovery", async () => {
     const inputs = [];
     const refusal = JSON.stringify({ type: "FreeTierError", message: "free tier can only be used within OpenCode" });
-    mocks.spawn.mockReturnValue(makeChild(403, refusal, { "content-type": "application/json" }, inputs));
+    const children = [
+      makeChild(403, refusal, { "content-type": "application/json" }, inputs),
+      makeChild(403, refusal, { "content-type": "application/json" }, inputs),
+    ];
+    mocks.spawn.mockImplementation(() => children.shift());
     process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
     await new OpenCodeExecutor().execute({
       model: "muse-spark-1.3-contributor-free", body: { input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }] },
       stream: true, credentials: { rawHeaders: { "x-opencode-session": "invalid-session" } },
     });
-    expect(mocks.spawn).toHaveBeenCalledOnce();
-    expect(inputs[0].headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(inputs[1].headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
   });
 
-  it("does not retry a caller-session FreeTier refusal", async () => {
+  it("preserves a caller-supplied session during recovery", async () => {
     const inputs = [];
     const refusal = JSON.stringify({ type: "FreeTierError", message: "free tier can only be used within OpenCode" });
-    mocks.spawn.mockReturnValue(makeChild(403, refusal, { "content-type": "application/json" }, inputs));
+    const children = [
+      makeChild(403, refusal, { "content-type": "application/json" }, inputs),
+      makeChild(403, refusal, { "content-type": "application/json" }, inputs),
+    ];
+    mocks.spawn.mockImplementation(() => children.shift());
     process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
     await new OpenCodeExecutor().execute({
       model: "muse-spark-1.3-contributor-free", body: { input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }] },
       stream: true, credentials: { rawHeaders: { "x-opencode-session": "ses_f534dfae8ffeCy4Ee4tLWNygDc" } },
     });
-    expect(mocks.spawn).toHaveBeenCalledOnce();
-    expect(inputs[0].headers["x-opencode-session"]).toBe("ses_f534dfae8ffeCy4Ee4tLWNygDc");
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(inputs[1].headers["x-opencode-session"]).toBe("ses_f534dfae8ffeCy4Ee4tLWNygDc");
   });
 
-  it("does not retry a second FreeTier refusal", async () => {
+  it("does not make a third attempt after a second FreeTier refusal", async () => {
     const inputs = [];
     const refusal = JSON.stringify({ type: "FreeTierError", message: "free tier can only be used within OpenCode" });
     mocks.spawn.mockReturnValue(makeChild(403, refusal, { "content-type": "application/json" }, inputs));
@@ -233,14 +232,19 @@ describe("OpenCode streaming transport status", () => {
       model: "muse-spark-1.3-contributor-free", body: { input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }] },
       stream: true, credentials: {},
     });
-    expect(mocks.spawn).toHaveBeenCalledOnce();
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
     expect(result.response.status).toBe(403);
   });
 
-  it("returns a classified OpenCode 429 without refreshing session or request identity", async () => {
+  it("refreshes session and request identity once after an OpenCode 429", async () => {
     const inputs = [];
     const rateLimit = JSON.stringify({ type: "FreeUsageLimitError", message: "rate limit exceeded" });
-    mocks.spawn.mockReturnValue(makeChild(429, rateLimit, { "content-type": "application/json" }, inputs));
+    const sse = "data: refreshed\\n\\n";
+    const children = [
+      makeChild(429, rateLimit, { "content-type": "application/json" }, inputs),
+      makeChild(200, sse, { "content-type": "text/event-stream" }, inputs),
+    ];
+    mocks.spawn.mockImplementation(() => children.shift());
     process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
     const result = await new OpenCodeExecutor().execute({
       model: "muse-spark-1.3-contributor-free",
@@ -253,13 +257,14 @@ describe("OpenCode streaming transport status", () => {
         },
       },
     });
-    expect(mocks.spawn).toHaveBeenCalledOnce();
-    expect(inputs[0].headers["x-opencode-session"]).toBe("ses_f534dfae8ffeCy4Ee4tLWNygDc");
-    expect(inputs[0].headers["x-opencode-request"]).not.toBe("msg_original");
-    expect(result.response.status).toBe(429);
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(inputs[1].headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(inputs[1].headers["x-opencode-session"]).not.toBe(inputs[0].headers["x-opencode-session"]);
+    expect(inputs[1].headers["x-opencode-request"]).not.toBe("msg_original");
+    expect(await result.response.text()).toBe(sse);
   });
 
-  it("does not retry a classified OpenCode 429", async () => {
+  it("does not make a third attempt after a second OpenCode 429", async () => {
     const inputs = [];
     const rateLimit = JSON.stringify({ type: "FreeUsageLimitError", message: "rate limit exceeded" });
     mocks.spawn.mockReturnValue(makeChild(429, rateLimit, { "content-type": "application/json" }, inputs));
@@ -269,26 +274,34 @@ describe("OpenCode streaming transport status", () => {
       body: { input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }] },
       stream: true, credentials: {},
     });
-    expect(mocks.spawn).toHaveBeenCalledOnce();
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
     expect(result.response.status).toBe(429);
   });
 
-  it("preserves caller tools on a classified OpenCode 429", async () => {
+  it("preserves caller tools and appends recovery tools after a classified OpenCode 429", async () => {
     const inputs = [];
     const tool = { type: "function", name: "lookup", parameters: { type: "object", properties: {} } };
     const rateLimit = JSON.stringify({ type: "FreeUsageLimitError", message: "rate limit exceeded" });
-    mocks.spawn.mockReturnValue(makeChild(429, rateLimit, { "content-type": "application/json" }, inputs));
+    const children = [
+      makeChild(429, rateLimit, { "content-type": "application/json" }, inputs),
+      makeChild(200, "data: recovered\\n\\n", { "content-type": "text/event-stream" }, inputs),
+    ];
+    mocks.spawn.mockImplementation(() => children.shift());
     process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
     const result = await new OpenCodeExecutor().execute({
       model: "muse-spark-1.3-contributor-free",
       body: { input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }], tools: [tool] },
       stream: true, credentials: {},
     });
-    const sentTools = JSON.parse(inputs[0].body).tools;
-    expect(mocks.spawn).toHaveBeenCalledOnce();
-    expect(sentTools[0]).toEqual(tool);
-    expect(sentTools.slice(1).map((entry) => entry.name)).toEqual(["bash", "glob", "grep", "read"]);
-    expect(result.response.status).toBe(429);
+    const firstTools = JSON.parse(inputs[0].body).tools;
+    const retryTools = JSON.parse(inputs[1].body).tools;
+    expect(mocks.spawn).toHaveBeenCalledTimes(2);
+    expect(firstTools[0]).toEqual(tool);
+    expect(retryTools[0]).toEqual(tool);
+    expect(retryTools.slice(1).map((entry) => entry.name)).toEqual(expect.arrayContaining(recoveryToolNames()));
+    expect(inputs[1].headers["x-opencode-session"]).not.toBe(inputs[0].headers["x-opencode-session"]);
+    expect(inputs[1].headers["x-opencode-request"]).not.toBe(inputs[0].headers["x-opencode-request"]);
+    expect(await result.response.text()).toBe("data: recovered\\n\\n");
   });
 
   it("preserves caller tools, appends the fingerprint quartet and learns only caller names", async () => {
