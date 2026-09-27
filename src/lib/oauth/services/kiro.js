@@ -272,9 +272,12 @@ export class KiroService {
    *   returns 403 "API key authentication is not supported for this operation"
    *   when that header is present. Chat/usage paths still send tokentype:API_KEY.
    */
-  async listAvailableProfiles(accessToken, region = "us-east-1") {
+  async listAvailableProfiles(accessToken, region = "us-east-1", options = {}) {
     assertValidAwsRegion(region);
     const endpoint = `https://codewhisperer.${region}.amazonaws.com`;
+    const tokenTypeHeaders = options.authMethod === "external_idp"
+      ? { tokentype: "EXTERNAL_IDP" }
+      : {};
 
     const response = await fetch(endpoint, {
       method: "POST",
@@ -283,6 +286,7 @@ export class KiroService {
         "x-amz-target": "AmazonCodeWhispererService.ListAvailableProfiles",
         "Authorization": `Bearer ${accessToken}`,
         "Accept": "application/json",
+        ...tokenTypeHeaders,
       },
       body: JSON.stringify({ maxResults: 10 }),
     });
