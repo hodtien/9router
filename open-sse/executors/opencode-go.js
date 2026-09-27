@@ -1,9 +1,8 @@
 import crypto from "node:crypto";
 import { DefaultExecutor } from "./default.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
-import { isMuseSparkModel } from "../providers/models/helpers.js";
-import { getProviderModels } from "../config/providerModels.js";
-import { modelTargetFormat } from "../providers/models/schema.js";
+import { getModelTargetFormat } from "../config/providerModels.js";
+import { FORMATS } from "../translator/formats.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -42,14 +41,10 @@ function translatedSession(sessionId, clientTool) {
   return `ses_${digest}`;
 }
 
-// Strip the thinking suffix "model(level)" so checks hit the base id.
-function baseModelId(model) {
-  return String(model || "").replace(/\([^()]+\)\s*$/, "").trim();
-}
-
+// Responses-only per the provider registry (grok-4.6, gpt-5.6-luna, muse-spark, …),
+// including the family-regex fallback for passthrough ids — never hardcode model ids here.
 function isResponsesModel(model) {
-  const entry = getProviderModels("opencode-go").find((item) => item.id === baseModelId(model));
-  return modelTargetFormat(entry) === "openai-responses";
+  return getModelTargetFormat("opencode-go", model) === FORMATS.OPENAI_RESPONSES;
 }
 
 // Flatten Chat Completions tool declarations into the Responses flat shape and
@@ -93,11 +88,12 @@ function sanitizeResponsesItems(body) {
   if (!Array.isArray(body.input)) return;
   body.input = body.input.filter((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return true;
-    // ponytail: strip prior-turn reasoning items. opencode uses pooled Console
-    // credentials that rotate across accounts; reasoning.encrypted_content can
-    // only be decrypted by the exact caller that issued it, so the item 400s
-    // "reasoning encrypted_content was not issued to this caller". Under
-    // store=false the missing blob also 400s as "not found or was deleted".
+    // Strip prior-turn reasoning items. OpenCode free routes through pooled
+    // Console credentials that rotate across accounts; reasoning.encrypted_content
+    // can only be decrypted by the exact caller/account that issued it, so replaying
+    // it across accounts or sessions causes 400 "reasoning encrypted_content was not
+    // issued to this caller". Under store=false, omitting the blob can also cause
+    // "not found or was deleted". Dropping prior reasoning items keeps tool loops valid.
     if (item.type === "reasoning") return false;
     delete item.encrypted_content;
     delete item.reasoning_encrypted_content;
