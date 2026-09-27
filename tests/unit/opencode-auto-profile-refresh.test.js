@@ -65,7 +65,10 @@ vi.mock("open-sse/config/runtimeConfig.js", async (importOriginal) => {
     },
   };
 });
-vi.mock("open-sse/translator/formats.js", () => ({ detectFormatByEndpoint: vi.fn(() => "openai") }));
+vi.mock("open-sse/translator/formats.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, detectFormatByEndpoint: vi.fn(() => "openai") };
+});
 vi.mock("open-sse/utils/earlySse.js", () => ({
   clientWantsStream: vi.fn(() => false),
   createKeepaliveSseResponse: vi.fn(),

@@ -20,6 +20,7 @@ const EXCLUDE_PATTERNS = [
   ".env",           // Environment files
   ".env.local",
   ".env.*.local",
+  ".build-home",    // Build-time HOME with generated secrets
   "*.log",          // Log files
   "tmp",            // Temp files
   ".DS_Store",      // macOS files
