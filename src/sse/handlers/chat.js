@@ -18,6 +18,7 @@ import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
+import { upstreamResponseHeaders } from "open-sse/utils/upstreamHeaders.js";
 import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
@@ -303,9 +304,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   });
   if (outcome.kind === "response") return outcome.response;
   if (outcome.kind === "unavailable") {
-    return unavailableResponse(outcome.status, outcome.message, outcome.retryAfter, outcome.retryAfterHuman);
+    return unavailableResponse(outcome.status, outcome.message, outcome.retryAfter, outcome.retryAfterHuman, outcome.headers);
   }
-  return errorResponse(outcome.status, outcome.message);
+  return errorResponse(outcome.status, outcome.message, outcome.headers);
 }
 
 /**
@@ -317,6 +318,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
   const excludeConnectionIds = new Set();
   let lastError = null;
   let lastStatus = null;
+  let lastHeaders = null;
 
   while (true) {
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { bypassModelWhitelist });
@@ -333,6 +335,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
           message: `[${provider}/${model}] ${errorMsg}`,
           retryAfter: credentials.retryAfter,
           retryAfterHuman: credentials.retryAfterHuman,
+          headers: lastHeaders,
         };
       }
       if (excludeConnectionIds.size === 0) {
@@ -344,6 +347,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
         kind: "error",
         status: lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE,
         message: lastError || "All accounts unavailable",
+        headers: lastHeaders,
       };
     }
 
@@ -439,6 +443,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;
+      lastHeaders = upstreamResponseHeaders(result.response?.headers);
       continue;
     }
 
