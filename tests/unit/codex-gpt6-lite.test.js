@@ -11,6 +11,14 @@ const credentials = { connectionId: "fixture", accessToken: "fixture-token" };
 afterEach(() => vi.restoreAllMocks());
 
 describe("Codex GPT-6 Sol/Luna transport", () => {
+  // gpt-6.1-sol has no exact capabilities entry, so it falls through the
+  // "*gpt-6*" pattern (1M context); gpt-6-sol / gpt-6-luna carry their own entry.
+  const CONTEXT_WINDOW = {
+    "gpt-6.1-sol": 1050000,
+    "gpt-6-sol": 272000,
+    "gpt-6-luna": 272000,
+  };
+
   it.each(["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"])("lists %s with Codex capabilities", (model) => {
     const entry = getModelsByProviderId("codex").find((item) => item.id === model);
     expect(entry?.responsesLite).toBe(true);
@@ -20,7 +28,7 @@ describe("Codex GPT-6 Sol/Luna transport", () => {
       reasoning: true,
       search: true,
       thinkingFormat: "openai",
-      contextWindow: 272000,
+      contextWindow: CONTEXT_WINDOW[model],
       maxOutput: 128000,
     });
     expect(getThinkingLevels("codex", model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
@@ -175,12 +183,12 @@ describe("Codex GPT-6 Sol/Luna transport", () => {
     expect(body.reasoning.context).toBe("all_turns");
   });
 
-  it("maps GPT-6.1 Sol's Codex-only ultra effort to max", () => {
+  it("maps GPT-6.1 Sol's Codex-only ultra effort to xhigh", () => {
     const body = new CodexExecutor().transformRequest("gpt-6.1-sol", {
       model: "gpt-6.1-sol", input: "hello", reasoning: { effort: "ultra" },
     }, true, credentials);
 
-    expect(body.reasoning).toEqual({ effort: "max", context: "all_turns" });
+    expect(body.reasoning).toEqual({ effort: "xhigh", context: "all_turns" });
   });
 
   it("sends the Lite shape and header in the actual outbound request", async () => {

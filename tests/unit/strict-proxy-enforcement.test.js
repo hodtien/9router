@@ -58,13 +58,13 @@ describe("strictProxy refuses a direct connection (#4333)", () => {
   it("throws when a pool is assigned but no proxy url resolved", async () => {
     await expect(
       proxyAwareFetch("https://api.example.com/v1/chat", {}, { proxyPoolId: "p1", strictProxy: true }),
-    ).rejects.toThrow(/strictProxy/);
+    ).rejects.toThrow(/\[ProxyFetch\] Proxy required/);
   });
 
   it("throws when the pool is enabled but carries an empty url", async () => {
     await expect(
       proxyAwareFetch("https://api.example.com/v1/chat", {}, { enabled: true, url: "", strictProxy: true }),
-    ).rejects.toThrow(/strictProxy/);
+    ).rejects.toThrow(/\[ProxyFetch\] Proxy required/);
   });
 
   it("does not block a caller that sets strictProxy with no proxy configured", async () => {
