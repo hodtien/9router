@@ -91,7 +91,8 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
-const requestedModel = options?.requestedModel || model;
+  const bypassModelWhitelist = options?.bypassModelWhitelist === true;
+  const requestedModel = options?.requestedModel || model;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -148,7 +149,8 @@ const requestedModel = options?.requestedModel || model;
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
-const enabled = c.providerSpecificData?.enabledModels;
+      if (!bypassModelWhitelist && !isConnectionAllowedForModel(c, model, providerId)) return false;
+      const enabled = c.providerSpecificData?.enabledModels;
       if (providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel)) return false;
       // Antigravity: skip if live quota exhausted for this model
       if (isAntigravity && model && antigravityQuotaCache) {
