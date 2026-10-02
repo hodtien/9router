@@ -22,7 +22,8 @@ import { upstreamResponseHeaders } from "open-sse/utils/upstreamHeaders.js";
 import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
-import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import { HTTP_STATUS, ALL_ACCOUNTS_COOLDOWN_WAIT_MS } from "open-sse/config/runtimeConfig.js";
+import { planCooldownRetry } from "open-sse/services/accountFallback.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { clientWantsStream, createKeepaliveSseResponse } from "open-sse/utils/earlySse.js";
@@ -328,6 +329,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
   let lastError = null;
   let lastStatus = null;
   let lastHeaders = null;
+  const cooldownDeadline = Date.now() + ALL_ACCOUNTS_COOLDOWN_WAIT_MS;
 
   while (true) {
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { bypassModelWhitelist, requestedModel: requestedModel || model });
@@ -335,6 +337,16 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
+        // Every account is inside its cooldown. Wait out the earliest unlock when it
+        // is close enough, so one-shot callers (subagents) retry instead of dying on
+        // a 429 that would clear on its own moments later.
+        const waitMs = planCooldownRetry(credentials.retryAfter, cooldownDeadline - Date.now());
+        if (waitMs > 0) {
+          log.warn("CHAT", `[${provider}/${model}] all accounts cooling down — waiting ${Math.ceil(waitMs / 1000)}s then retrying`);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);

@@ -81,6 +81,28 @@ export function isAccountUnavailable(unavailableUntil) {
 }
 
 /**
+ * Decide whether an all-accounts-in-cooldown result should be waited out
+ * internally instead of surfaced to the client.
+ *
+ * Returns the wait in ms when the earliest unlock is close enough that retrying
+ * is likely to find a usable account, otherwise 0. Bounded by the caller's
+ * budget so an exhausted pool still fails fast.
+ *
+ * @param {string|null} retryAfter - ISO timestamp of the earliest unlock
+ * @param {number} budgetMs - Maximum total time we're willing to wait
+ * @param {number} now - Injectable clock for tests
+ */
+export function planCooldownRetry(retryAfter, budgetMs, now = Date.now()) {
+  if (!retryAfter || !(budgetMs > 0)) return 0;
+  const unlockAt = new Date(retryAfter).getTime();
+  if (!Number.isFinite(unlockAt)) return 0;
+  const waitMs = unlockAt - now;
+  // Already unlocked, or too far out to be worth holding the request open.
+  if (waitMs <= 0 || waitMs > budgetMs) return 0;
+  return waitMs;
+}
+
+/**
  * Calculate unavailable until timestamp
  */
 export function getUnavailableUntil(cooldownMs) {

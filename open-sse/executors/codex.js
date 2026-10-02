@@ -16,7 +16,14 @@ import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
 
 // SSE error patterns inside 200-OK bodies. Some retry same account first; capacity rotates accounts.
 const CODEX_SSE_RETRY_PATTERNS = ["server_is_overloaded", "service_unavailable_error"];
-const CODEX_SSE_ACCOUNT_FALLBACK_PATTERNS = ["selected model is at capacity", "model_at_capacity"];
+const CODEX_SSE_ACCOUNT_FALLBACK_PATTERNS = [
+  "selected model is at capacity",
+  "model_at_capacity",
+  "usage_limit_reached",
+  "rate_limit",
+  "model_not_found",
+  "is not supported when using codex with a chatgpt account",
+];
 const CODEX_SSE_USER_OUTPUT_PATTERNS = [
   "event: response.output_text.delta",
   "event: response.function_call_arguments.delta",
