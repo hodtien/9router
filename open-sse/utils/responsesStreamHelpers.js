@@ -26,12 +26,15 @@ export function isOpenAIResponsesTerminalEvent(eventName, chunk) {
 const sharedEncoder = new TextEncoder();
 
 // Encoded response.failed + [DONE] payload for aborted/stalled Responses passthrough streams
-export function buildAbortedResponsesTerminalBytes() {
-  return sharedEncoder.encode(`${formatIncompleteOpenAIResponsesStreamFailure()}data: [DONE]\n\n`);
+export function buildAbortedResponsesTerminalBytes(context = {}) {
+  return sharedEncoder.encode(`${formatIncompleteOpenAIResponsesStreamFailure(context)}data: [DONE]\n\n`);
 }
 
-// Synthesize a response.failed event for streams that close without a terminal event
-export function formatIncompleteOpenAIResponsesStreamFailure() {
+// Synthesize a response.failed event for streams that close without a terminal event.
+// Names the upstream that cut the stream short: this path has no account retry,
+// so the provider/model is the only clue about where the failure came from.
+export function formatIncompleteOpenAIResponsesStreamFailure({ provider, model } = {}) {
+  const target = [provider, model].filter(Boolean).join("/");
   return formatSSE({
     event: "response.failed",
     data: {
@@ -42,7 +45,9 @@ export function formatIncompleteOpenAIResponsesStreamFailure() {
         error: {
           type: "stream_error",
           code: "stream_disconnected",
-          message: "stream closed before response.completed"
+          message: target
+            ? `${target} closed the stream before response.completed`
+            : "stream closed before response.completed"
         }
       }
     }

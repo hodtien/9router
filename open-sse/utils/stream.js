@@ -298,7 +298,7 @@ export function createSSEStream(options = {}) {
 
           // Synthesize response.failed if the Responses stream never sent a terminal event
           if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
-            const failedOutput = formatIncompleteOpenAIResponsesStreamFailure();
+            const failedOutput = formatIncompleteOpenAIResponsesStreamFailure({ provider, model });
             reqLogger?.appendConvertedChunk?.(failedOutput);
             controller.enqueue(sharedEncoder.encode(failedOutput));
             openAIResponsesTerminalSeen = true;
@@ -566,11 +566,10 @@ export function createSSEStream(options = {}) {
             if (item.type === "message_stop") claudeMessageStopSeen = true;
           }
         }
-// Synthesize response.failed if a Responses passthrough stream never reached a terminal event
         // Synthesize response.failed if a Responses passthrough stream never reached a terminal event
         const keepsOpenAIResponsesFormat = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES;
         if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
-          const failedOutput = formatIncompleteOpenAIResponsesStreamFailure();
+          const failedOutput = formatIncompleteOpenAIResponsesStreamFailure({ provider, model });
           reqLogger?.appendConvertedChunk?.(failedOutput);
           controller.enqueue(sharedEncoder.encode(failedOutput));
           openAIResponsesTerminalSeen = true;
