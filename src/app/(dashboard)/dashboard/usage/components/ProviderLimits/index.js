@@ -276,7 +276,7 @@ export default function ProviderLimits() {
         `[ProviderLimits] Fetching quota for ${provider} (${connectionId})`,
       );
       const url = `/api/usage/${connectionId}${force ? "?force=1" : ""}`;
-      const response = await fetch(url);
+      const response = await fetch(url, { credentials: "include" });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -364,10 +364,11 @@ export default function ProviderLimits() {
         const response = provider === "claude"
           ? await fetch(`/api/usage/${connectionId}/claude-reset`, {
             method: "POST",
+            credentials: "include",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ grantId: quotaData[connectionId]?.raw?.resetCredits?.nextGrantId }),
           })
-          : await fetch(`/api/usage/${connectionId}/codex-reset-credits`, { method: "POST" });
+          : await fetch(`/api/usage/${connectionId}/codex-reset-credits`, { method: "POST", credentials: "include" });
         const result = await response.json().catch(() => ({}));
 
         if (!response.ok) {
@@ -393,7 +394,7 @@ export default function ProviderLimits() {
   const handleViewCodexResetCredits = useCallback(async (connection) => {
     setResetCreditsState({ connection, loading: true, error: null, data: null });
     try {
-      const response = await fetch(`/api/usage/${connection.id}/codex-reset-credits`, { cache: "no-store" });
+      const response = await fetch(`/api/usage/${connection.id}/codex-reset-credits`, { cache: "no-store", credentials: "include" });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(result.error || result.message || "Failed to load Codex reset credits");
