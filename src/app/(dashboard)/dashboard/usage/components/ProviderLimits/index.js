@@ -240,6 +240,7 @@ export default function ProviderLimits() {
 
         const response = await fetch(
           `/api/providers/client?${params.toString()}`,
+          { credentials: "include" },
         );
         if (!response.ok) throw new Error("Failed to fetch connections");
 
@@ -416,7 +417,7 @@ export default function ProviderLimits() {
       if (!confirm("Delete this connection?")) return;
       setDeletingId(id);
       try {
-        const res = await fetch(`/api/providers/${id}`, { method: "DELETE" });
+        const res = await fetch(`/api/providers/${id}`, { method: "DELETE", credentials: "include" });
         if (res.ok) {
           setQuotaData((prev) => {
             const next = { ...prev };
@@ -465,6 +466,7 @@ export default function ProviderLimits() {
       setTogglingId(id);
       try {
         const res = await fetch(`/api/providers/${id}`, {
+          credentials: "include",
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ isActive }),
@@ -492,6 +494,7 @@ export default function ProviderLimits() {
       const provider = selectedConnection.provider;
       try {
         const res = await fetch(`/api/providers/${connectionId}`, {
+          credentials: "include",
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(formData),
@@ -513,7 +516,7 @@ export default function ProviderLimits() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/proxy-pools?isActive=true", { cache: "no-store" })
+    fetch("/api/proxy-pools?isActive=true", { cache: "no-store", credentials: "include" })
       .then((res) => res.json())
       .then((data) => {
         if (!cancelled && data?.proxyPools) {
@@ -618,7 +621,7 @@ export default function ProviderLimits() {
 
   // Load auto-ping per-connection maps
   useEffect(() => {
-    fetch("/api/settings", { cache: "no-store" })
+    fetch("/api/settings", { cache: "no-store", credentials: "include" })
       .then((r) => (r.ok ? r.json() : {}))
       .then((s) => {
         setAutoPingMaps({
@@ -639,10 +642,11 @@ export default function ProviderLimits() {
     const nextMaps = { ...autoPingMaps, [provider]: nextProviderMap };
     setAutoPingMaps(nextMaps);
     try {
-      const r = await fetch("/api/settings", { cache: "no-store" });
+      const r = await fetch("/api/settings", { cache: "no-store", credentials: "include" });
       const s = r.ok ? await r.json() : {};
       const cfg = { ...(s[settingsKey] || {}), connections: nextProviderMap };
       await fetch("/api/settings", {
+        credentials: "include",
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ [settingsKey]: cfg }),
@@ -656,6 +660,7 @@ export default function ProviderLimits() {
     setQuotaVisibility(nextVisibility);
     try {
       const response = await fetch("/api/settings", {
+        credentials: "include",
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ quotaVisibility: nextVisibility }),
@@ -815,6 +820,7 @@ export default function ProviderLimits() {
         await Promise.all(
           targetIds.map((id) =>
             fetch(`/api/providers/${id}`, {
+              credentials: "include",
               method: "PUT",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ isActive }),
