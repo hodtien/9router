@@ -163,6 +163,12 @@ async function canAccessPublicLlmApi(request) {
 
 async function canAccessLocalOnlyRoute(request) {
   if (await hasValidCliToken(request)) return true;
+  if (
+    request.nextUrl.pathname === "/api/cli-tools/opencode-profile"
+    && request.method === "POST"
+    && request.headers.get("origin") === request.nextUrl.origin
+    && await hasValidToken(request)
+  ) return true;
   // Browser on host: loopback Host + Origin (blocks tunnel/CSRF) + auth (JWT or requireLogin=false)
   if (isLocalRequest(request) && await isAuthenticated(request)) return true;
   return false;
