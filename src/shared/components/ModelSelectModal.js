@@ -83,8 +83,6 @@ export default function ModelSelectModal({
   capFilter = null,
   addedModelValues = [],
   closeOnSelect = true,
-  hideCombos = false,
-  onlyActiveProviders = false,
 }) {
   // Filter activeProviders by serviceKinds when kindFilter set (e.g. "webSearch", "webFetch")
   const filteredActiveProviders = useMemo(() => {
@@ -136,8 +134,8 @@ export default function ModelSelectModal({
   };
 
   useEffect(() => {
-    if (isOpen && !hideCombos) fetchCombos();
-  }, [isOpen, hideCombos]);
+    if (isOpen) fetchCombos();
+  }, [isOpen]);
 
   const fetchProviderNodes = async () => {
     try {
@@ -218,13 +216,19 @@ export default function ModelSelectModal({
       ? NO_AUTH_PROVIDER_IDS.filter((id) => (AI_PROVIDERS[id]?.serviceKinds || ["llm"]).includes(kindFilter))
       : NO_AUTH_PROVIDER_IDS;
 
-    // Only show connected providers (including both standard and custom).
-    // When onlyActiveProviders is set (e.g. the per-account allowed-models
-    // picker), exclude no-auth free providers so the list stays scoped to the
-    // single connection's provider.
+    // Compatible nodes with custom models must remain selectable without an API-key connection.
+    const compatibleNodeIds = kindFilter
+      ? []
+      : customModels
+          .map((model) => model.providerAlias)
+          .filter((alias) => isOpenAICompatibleProvider(alias) || isAnthropicCompatibleProvider(alias));
+
+    // For a per-account restriction picker, omit no-auth providers and retain only the
+    // represented connection; otherwise include normal no-auth and compatible nodes.
     const providerIdsToShow = new Set([
-      ...activeConnectionIds,                       // Only connected providers
-      ...(onlyActiveProviders ? [] : noAuthIds),    // No-auth providers (kind-filtered)
+      ...activeConnectionIds,
+      ...(onlyActiveProviders ? [] : noAuthIds),
+      ...compatibleNodeIds,
     ]);
 
     // Sort by PROVIDER_ORDER
@@ -429,15 +433,15 @@ export default function ModelSelectModal({
     });
 
     return groups;
-  }, [filteredActiveProviders, modelAliases, allProviders, providerNodes, customModels, disabledModels, kindFilter, activeProviders, onlyActiveProviders, cursorModels, clineModels, clinepassModels]);
+  }, [filteredActiveProviders, modelAliases, allProviders, providerNodes, customModels, disabledModels, kindFilter, activeProviders, cursorModels, clineModels, clinepassModels]);
 
   // Filter combos by search query (and hide combos when kindFilter is set — combos are LLM-only by design)
   const filteredCombos = useMemo(() => {
-    if (kindFilter || hideCombos || capFilter) return [];
+    if (kindFilter || capFilter) return [];
     if (!searchQuery.trim()) return combos;
     const query = searchQuery.toLowerCase();
     return combos.filter(c => c.name.toLowerCase().includes(query));
-  }, [combos, searchQuery, kindFilter, hideCombos, capFilter]);
+  }, [combos, searchQuery, kindFilter]);
 
   // Sort models alphabetically, with added models floated to top
   const sortModels = (models) => {
@@ -663,6 +667,4 @@ ModelSelectModal.propTypes = {
   kindFilter: PropTypes.string,
   addedModelValues: PropTypes.arrayOf(PropTypes.string),
   closeOnSelect: PropTypes.bool,
-  hideCombos: PropTypes.bool,
-  onlyActiveProviders: PropTypes.bool,
 };

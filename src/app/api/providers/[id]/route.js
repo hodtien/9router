@@ -5,6 +5,7 @@ import {
   updateProviderConnection,
   deleteProviderConnection,
 } from "@/models";
+import { toProviderConnectionResponse, usesAwsCredentialForm } from "@/lib/providerConnectionResponse";
 import { isAnthropicCompatibleProvider, isOpenAICompatibleProvider } from "@/shared/constants/providers";
 import { normalizeDefaultModel } from "@/lib/providerNormalization";
 import * as log from "@/sse/utils/logger";
@@ -72,14 +73,7 @@ export async function GET(request, { params }) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
 
-    // Hide sensitive fields
-    const result = { ...connection };
-    delete result.apiKey;
-    delete result.accessToken;
-    delete result.refreshToken;
-    delete result.idToken;
-
-    return NextResponse.json({ connection: result });
+    return NextResponse.json({ connection: toProviderConnectionResponse(connection) });
   } catch (error) {
     log.warn("PROVIDERS", "Failed to fetch connection", { error: error?.message });
     return NextResponse.json({ error: "Failed to fetch connection" }, { status: 500 });
@@ -123,17 +117,13 @@ export async function PUT(request, { params }) {
     const updateData = {};
     if (name !== undefined) updateData.name = name;
     if (priority !== undefined) updateData.priority = priority;
-    if (defaultModel !== undefined) {
-      // Auto-prefix with the connection's namespace for compatible providers,
-      // matching the create-time behavior in /api/providers POST.
-      if (isOpenAICompatibleProvider(existing.provider) || isAnthropicCompatibleProvider(existing.provider)) {
-        const psdPrefix = (updateData.providerSpecificData?.prefix) ?? existing.providerSpecificData?.prefix;
-        updateData.defaultModel = normalizeDefaultModel(psdPrefix, defaultModel);
-      } else {
-        updateData.defaultModel = defaultModel;
-      }
-    }
     if (globalPriority !== undefined) updateData.globalPriority = globalPriority;
+    if (defaultModel !== undefined) {
+      const prefix = providerSpecificData?.prefix ?? existing.providerSpecificData?.prefix;
+      updateData.defaultModel = isOpenAICompatibleProvider(existing.provider) || isAnthropicCompatibleProvider(existing.provider)
+        ? normalizeDefaultModel(prefix, defaultModel)
+        : defaultModel;
+    }
     if (isActive !== undefined) updateData.isActive = isActive;
     if (apiKey && existing.authType === "apikey") updateData.apiKey = apiKey;
     if (testStatus !== undefined) updateData.testStatus = testStatus;
@@ -143,12 +133,8 @@ export async function PUT(request, { params }) {
       if (!Array.isArray(allowedModels)) {
         return NextResponse.json({ error: "allowedModels must be an array" }, { status: 400 });
       }
-      const cleaned = Array.from(new Set(allowedModels.map((m) => (typeof m === "string" ? m.trim() : "")).filter(Boolean)));
-      if (cleaned.length === 0) {
-        updateData.allowedModels = null;
-      } else {
-        updateData.allowedModels = cleaned;
-      }
+      const cleaned = Array.from(new Set(allowedModels.map((model) => typeof model === "string" ? model.trim() : "").filter(Boolean)));
+      updateData.allowedModels = cleaned.length ? cleaned : null;
     }
 
     if (
@@ -159,10 +145,20 @@ export async function PUT(request, { params }) {
         proxyPoolResult.hasProxyPoolField
       )
     ) {
+      const incomingProviderSpecificData = { ...(providerSpecificData || {}) };
+      const isAwsCredential = usesAwsCredentialForm(existing.provider);
+      // The edit form cannot read the stored token back. An empty password field means
+      // keep the saved credential; null explicitly removes it.
+      if (isAwsCredential && incomingProviderSpecificData.sessionToken === "") {
+        delete incomingProviderSpecificData.sessionToken;
+      }
       updateData.providerSpecificData = {
         ...(existing.providerSpecificData || {}),
-        ...(providerSpecificData || {}),
+        ...incomingProviderSpecificData,
       };
+      if (isAwsCredential && incomingProviderSpecificData.sessionToken === null) {
+        delete updateData.providerSpecificData.sessionToken;
+      }
 
       if (proxyConfig.hasAnyProxyField) {
         updateData.providerSpecificData.connectionProxyEnabled = proxyConfig.connectionProxyEnabled;
@@ -181,14 +177,7 @@ export async function PUT(request, { params }) {
 
     const updated = await updateProviderConnection(id, updateData);
 
-    // Hide sensitive fields
-    const result = { ...updated };
-    delete result.apiKey;
-    delete result.accessToken;
-    delete result.refreshToken;
-    delete result.idToken;
-
-    return NextResponse.json({ connection: result });
+    return NextResponse.json({ connection: toProviderConnectionResponse(updated) });
   } catch (error) {
     log.warn("PROVIDERS", "Failed to update connection", { error: error?.message });
     return NextResponse.json({ error: "Failed to update connection" }, { status: 500 });
