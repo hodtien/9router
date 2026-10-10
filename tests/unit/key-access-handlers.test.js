@@ -99,7 +99,9 @@ beforeEach(() => {
     : { success: true, response: sse([ROLE, CONTENT(`from-${modelInfo.model}`), DONE]) }));
 });
 
-const chat = (model, k) => handleChat(post("/v1/chat/completions", { model, stream: true, messages: [{ role: "user", content: "hi" }] }, k));
+// Chat's early-SSE wrapper deliberately returns HTTP 200 once the stream opens. Keep
+// these authorization assertions non-streaming so a 403/500 remains observable.
+const chat = (model, k) => handleChat(post("/v1/chat/completions", { model, stream: false, messages: [{ role: "user", content: "hi" }] }, k));
 
 describe("chat (/v1/chat/completions, /v1/messages, /v1/responses all use handleChat)", () => {
   beforeEach(() => mocks.getProviderCredentials.mockResolvedValue({ connectionId: "conn", connectionName: "mock" }));
