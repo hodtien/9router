@@ -2,11 +2,12 @@ import { translateResponse, initState } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
+import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, buildStreamErrorBytes } from "./streamHelpers.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
 import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
+import { HTTP_STATUS } from "../config/runtimeConfig.js";
 
 export { COLORS, formatSSE };
 export { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER };
@@ -495,7 +496,15 @@ export function createSSEStream(options = {}) {
           }
         }
 
-        const flushed = translateResponse(targetFormat, sourceFormat, null, state);
+        // Do not let the Responses→Chat translator synthesize finish_reason=stop on EOF.
+        // Its null-chunk flush assumes the upstream completed successfully, but a Responses
+        // stream can close cleanly after partial deltas without a terminal event.
+        const incompleteTranslatedResponses = targetFormat === FORMATS.OPENAI_RESPONSES &&
+          sourceFormat !== FORMATS.OPENAI_RESPONSES &&
+          !openAIResponsesTerminalSeen;
+        const flushed = incompleteTranslatedResponses
+          ? []
+          : translateResponse(targetFormat, sourceFormat, null, state);
 
         if (flushed?._openaiIntermediate) {
           for (const item of flushed._openaiIntermediate) {
@@ -566,15 +575,25 @@ export function createSSEStream(options = {}) {
             if (item.type === "message_stop") claudeMessageStopSeen = true;
           }
         }
-        // Synthesize response.failed if a Responses passthrough stream never reached a terminal event
-        const keepsOpenAIResponsesFormat = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES;
-        if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
-          const failedOutput = formatIncompleteOpenAIResponsesStreamFailure({ provider, model });
-          reqLogger?.appendConvertedChunk?.(failedOutput);
-          controller.enqueue(sharedEncoder.encode(failedOutput));
-          openAIResponsesTerminalSeen = true;
+        const isResponsesSource = targetFormat === FORMATS.OPENAI_RESPONSES;
+        const keepsOpenAIResponsesFormat = isResponsesSource && sourceFormat === FORMATS.OPENAI_RESPONSES;
+        if (isResponsesSource && !openAIResponsesTerminalSeen) {
+          if (keepsOpenAIResponsesFormat) {
+            const failedOutput = formatIncompleteOpenAIResponsesStreamFailure({ provider, model });
+            reqLogger?.appendConvertedChunk?.(failedOutput);
+            controller.enqueue(sharedEncoder.encode(failedOutput));
+            openAIResponsesTerminalSeen = true;
+          } else if (incompleteTranslatedResponses) {
+            const errorOutput = buildStreamErrorBytes(
+              HTTP_STATUS.BAD_GATEWAY,
+              `${provider || "OpenAI Responses"}/${model || "unknown model"} closed the stream before response.completed`,
+              sourceFormat,
+            );
+            reqLogger?.appendConvertedChunk?.(new TextDecoder().decode(errorOutput));
+            controller.enqueue(errorOutput);
+            state.finishReasonSent = true;
+          }
         }
-
         if (keepsOpenAIResponsesFormat && !openAIResponsesDoneSent && !streamDoneSent) {
           const doneOutput = "data: [DONE]\n\n";
           reqLogger?.appendConvertedChunk?.(doneOutput);
