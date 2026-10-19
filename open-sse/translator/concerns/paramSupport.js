@@ -5,8 +5,6 @@ import { getCapabilitiesForModel } from "../../providers/capabilities.js";
 
 // Each rule: optional provider, regex match on model, list of params to drop.
 // A param is removed only when it is present (!== undefined).
-// For Sakana we also need a conditional drop: drop reasoning_effort ONLY
-// when its value is not in the Sakana-accepted enum {high, xhigh, max}.
 const STRIP_RULES = [
   // All Claude models: temperature deprecated/rejected upstream (Anthropic 400). #1748
   { match: /claude/i, drop: ["temperature"] },
@@ -14,8 +12,6 @@ const STRIP_RULES = [
   { provider: "github", match: /gpt-5\.4/i, drop: ["temperature"] },
   // GitHub Copilot Claude (except opus/sonnet 4.6): thinking + reasoning_effort rejected. #713
   { provider: "github", match: (m) => /claude/i.test(m) && !/claude.*(opus|sonnet).*4\.6/i.test(m), drop: ["thinking", "reasoning_effort"] },
-  // xAI Grok: reasoning_effort / reasoning / thinking rejected ("Model grok-build-0.1 does not support parameter reasoning")
-  { provider: "xai", match: /grok/i, drop: ["reasoning_effort", "reasoning", "thinking"] },
   // Cloudflare Workers AI: content must be plain string, rejects OpenAI content-part array (#1926)
   { provider: "cloudflare-ai", flattenContent: true },
   // Sakana fugu / fugu-ultra / fugu-ultra-20260615:
@@ -57,6 +53,15 @@ const STRIP_RULES = [
   { provider: "groq", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
   { provider: "mistral", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
   { provider: "cerebras", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
+  // OpenCode Go's relay rejects `response_format` for its deepseek family with HTTP
+  // 400 — both json_schema and json_object — while glm / kimi / mimo / minimax /
+  // qwen / grok / gpt on the same relay accept it. The rejection body is either a
+  // bare model echo (`{"model":"deepseek-v4.1-flash"}`, which names neither the
+  // field nor the reason) or "This response_format type is unavailable now", so a
+  // client cannot classify it and keeps re-sending the field. Measured 2026-10-13
+  // against /zen/go/v1/chat/completions with one key: 12/12 structured calls 400,
+  // 4/4 identical calls without the field 200.
+  { provider: "opencode-go", match: /^deepseek/i, drop: ["response_format"] },
 ];
 
 // Enforce minimum values for params (e.g. max_tokens floor).
@@ -77,12 +82,6 @@ const MIN_RULES = [
 ];
 
 // Test a rule's match (regex or predicate) against the model id.
-// Rules without `match` apply whenever the provider matches (or is unset).
-// IMPORTANT: this falls through to `true` when neither `match` nor `provider`
-// is present. Today every STRIP_RULES / MIN_RULES entry sets at least one, so
-// the fallthrough is safe — but a future rule that sets neither would silently
-// fire on every model. Add an explicit `match` (or a `provider` guard) on any
-// new rule.
 function matches(rule, model) {
   if (!rule.match) return true;
   return typeof rule.match === "function" ? rule.match(model) : rule.match.test(model);
@@ -102,21 +101,6 @@ export function stripUnsupportedParams(provider, model, body) {
     if (!matches(rule, model)) continue;
     for (const key of rule.drop || []) {
       if (body[key] !== undefined) delete body[key];
-    }
-    // Conditional drop: remove key unless its value is in the allow-list.
-    for (const [key, allowed] of Object.entries(rule.dropIfValueNotIn || {})) {
-      if (body[key] !== undefined && !allowed.includes(body[key])) {
-        delete body[key];
-      }
-    }
-    // Conditional drop for object form: remove the object unless its inner
-    // `effort` field is in the allow-list.
-    if (rule.dropReasoningObjectUnless) {
-      const { field, allow } = rule.dropReasoningObjectUnless;
-      const obj = body[field];
-      if (obj && typeof obj === "object" && !allow.includes(obj.effort)) {
-        delete body[field];
-      }
     }
     // Per-message field drop (assistant turns only — that is where clients replay reasoning).
     if (Array.isArray(rule.dropMessageFields) && Array.isArray(body.messages)) {
@@ -151,22 +135,6 @@ export function stripUnsupportedParams(provider, model, body) {
         clampNumber(body, "max_tokens", ceiling);
         clampNumber(body, "max_completion_tokens", ceiling);
         clampNumber(body, "max_output_tokens", ceiling);
-      }
-    }
-  }
-  return body;
-}
-
-// Clamp numeric params up to a model-specific floor in place; returns body.
-// Pairs with stripUnsupportedParams — same rule shape, different action.
-export function enforceParamMinimums(provider, model, body) {
-  if (!model || !body || typeof body !== "object") return body;
-  for (const rule of MIN_RULES) {
-    if (rule.provider && rule.provider !== provider) continue;
-    if (!matches(rule, model)) continue;
-    for (const [key, minVal] of Object.entries(rule.min || {})) {
-      if (typeof body[key] === "number" && body[key] < minVal) {
-        body[key] = minVal;
       }
     }
   }
