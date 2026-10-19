@@ -11,6 +11,7 @@ function createBuildFixture(distDir) {
   mkdirSync(join(buildRoot, "standalone"), { recursive: true });
   mkdirSync(join(buildRoot, "static", "chunks"), { recursive: true });
   mkdirSync(join(projectRoot, "public"), { recursive: true });
+  mkdirSync(join(projectRoot, "open-sse", "executors"), { recursive: true });
   writeFileSync(join(buildRoot, "static", "chunks", "app.js"), "static asset");
   writeFileSync(join(projectRoot, "public", "favicon.svg"), "public asset");
   return projectRoot;
@@ -35,6 +36,16 @@ describe("standalone build assets", () => {
 
     expect(readFileSync(join(projectRoot, ".next-cli-build", "standalone", ".next-cli-build", "static", "chunks", "app.js"), "utf8"))
       .toBe("static asset");
+  });
+
+  it("copies the OpenCode Bun fetcher into the standalone output", () => {
+    const projectRoot = createBuildFixture(".next");
+    writeFileSync(join(projectRoot, "open-sse", "executors", "_opencode-fetcher.js"), "fetcher");
+
+    copyStandaloneAssets({ projectRoot, distDir: ".next" });
+
+    expect(readFileSync(join(projectRoot, ".next", "standalone", "_opencode-fetcher.js"), "utf8"))
+      .toBe("fetcher");
   });
 
   // Without the wrapper beside server.js nothing can prove a request is local.

@@ -16,6 +16,10 @@ import {
   generateRequestId,
   translateSessionId,
   stableSessionId,
+  supportsPublicSessionRefresh,
+  createPublicSessionCandidate,
+  publishPublicSessionCandidate,
+  activePublicSessionId,
   deriveRequestId,
 } from "../../open-sse/executors/opencode.js";
 
@@ -115,6 +119,14 @@ describe("OpenCode Free Executor Session Resolution", () => {
 
     expect(prepared._opencodeSession).toMatch(OPENCODE_SESSION_RE);
     expect(prepared._opencodeSession).not.toBe("invalid-session-uuid");
+  });
+
+  it("preserves valid x-session-id aliases while preferring native OpenCode sessions", () => {
+    const executor = getExecutor("opencode");
+    const alias = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
+    const native = generateSessionId();
+    expect(prepare(executor, { credentials: makeCredentials({ rawHeaders: { "x-session-id": alias } }) }).prepared._opencodeSession).toBe(alias);
+    expect(prepare(executor, { credentials: makeCredentials({ rawHeaders: { "x-session-id": alias, "x-opencode-session": native } }) }).prepared._opencodeSession).toBe(native);
   });
 
   it("translates conversation session deterministically", () => {
@@ -241,6 +253,77 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
 
     expect(forKey("user-A")).not.toBe(forKey("user-B"));
     expect(forKey("user-A")).toMatch(OPENCODE_SESSION_RE);
+  });
+
+  it("publishes candidate sessions only for strict Public proxy 8900", () => {
+    const makePublic = (pool, port = "8900", strictProxy = true) => ({
+      id: "noauth",
+      connectionId: "noauth",
+      connectionName: "Public",
+      providerSpecificData: {
+        connectionProxyEnabled: true,
+        connectionProxyUrl: `http://proxy.example:${port}`,
+        connectionProxyPoolId: pool,
+        strictProxy,
+      },
+      rawHeaders: {},
+    });
+    const target = makePublic("pool-8900");
+    const otherPool = makePublic("pool-other", "8900");
+    expect(supportsPublicSessionRefresh(target)).toBe(true);
+    expect(supportsPublicSessionRefresh(makePublic("pool-http", "8901"))).toBe(false);
+    expect(supportsPublicSessionRefresh({ ...target, providerSpecificData: { ...target.providerSpecificData, connectionProxyUrl: "ftp://proxy.example:8900" } })).toBe(false);
+    expect(supportsPublicSessionRefresh({ ...target, providerSpecificData: { ...target.providerSpecificData, connectionProxyUrl: "http://proxy.example:8900/path" } })).toBe(true);
+    const candidate = createPublicSessionCandidate(target);
+    expect(candidate.sessionId).toMatch(OPENCODE_SESSION_RE);
+    expect(activePublicSessionId(target)).toBeNull();
+    expect(publishPublicSessionCandidate(candidate)).toBe(true);
+    expect(activePublicSessionId(target)).toBe(candidate.sessionId);
+    expect(activePublicSessionId(otherPool)).toBeNull();
+    expect(createPublicSessionCandidate(makePublic("pool-insecure", "8900", false))).toBeNull();
+    expect(createPublicSessionCandidate({ ...target, connectionId: "paid-account" })).toBeNull();
+  });
+
+  it("uses the published Public session ahead of stale native sessions", () => {
+    const executor = getExecutor("opencode");
+    const credentials = {
+      id: "noauth",
+      connectionId: "noauth",
+      connectionName: "Public",
+      providerSpecificData: {
+        connectionProxyEnabled: true,
+        connectionProxyUrl: "http://proxy.example:8900",
+        connectionProxyPoolId: "pool-override",
+        strictProxy: true,
+      },
+      rawHeaders: {},
+    };
+    const candidate = createPublicSessionCandidate(credentials);
+    publishPublicSessionCandidate(candidate);
+    const normal = executor.prepareRequestCredentials({
+      body: { messages: [{ role: "user", content: "hello" }] },
+      credentials,
+      providerSessionId: "chat-core-seed",
+      clientTool: "claude",
+    });
+    expect(normal._opencodeSession).toBe(candidate.sessionId);
+
+    const nativeSession = generateSessionId();
+    const native = executor.prepareRequestCredentials({
+      body: { messages: [{ role: "user", content: "hello" }] },
+      credentials: { ...credentials, rawHeaders: { "x-opencode-session": nativeSession } },
+      providerSessionId: "chat-core-seed",
+      clientTool: "claude",
+    });
+    expect(native._opencodeSession).toBe(candidate.sessionId);
+
+    const probe = executor.prepareRequestCredentials({
+      body: { messages: [{ role: "user", content: "hello" }] },
+      credentials: { ...credentials, rawHeaders: { "x-opencode-session": candidate.sessionId } },
+      providerSessionId: candidate.sessionId,
+      clientTool: "opencode",
+    });
+    expect(probe._opencodeSession).toBe(candidate.sessionId);
   });
 
   it("exposes the stable session helper directly", () => {

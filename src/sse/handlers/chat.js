@@ -13,7 +13,10 @@ import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { isOpencodeFreeTierRateLimitForProvider } from "open-sse/executors/opencodeGeoBlock.js";
 import { isGatedFreeTierRequest } from "open-sse/executors/opencodeFreeTierContract.js";
-import { refreshOpenCodeProfile } from "@/lib/opencodeProfile.js";
+import {
+  pendingOpenCodeProfileRecovery,
+  recoverOpenCodeProfile,
+} from "@/lib/opencodeProfileRecovery.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
@@ -59,6 +62,8 @@ function profileProxyOptions(credentials) {
     connectionProxyUrl: data.connectionProxyUrl || "",
     connectionNoProxy: data.connectionNoProxy || "",
     connectionProxyPoolId: data.connectionProxyPoolId || null,
+    connectionId: credentials?.connectionId ?? credentials?.id ?? null,
+    connectionName: credentials?.connectionName ?? null,
     strictProxy: data.strictProxy === true,
     vercelRelayUrl: data.vercelRelayUrl || "",
   };
@@ -378,6 +383,23 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
       };
     }
 
+    // A classified free-tier 429 starts a profile flight. The failed request returns
+    // immediately, but the next Public request must wait for that flight before
+    // resolving its executor session so it cannot reuse the stale override.
+    const profileProxy = profileProxyOptions(credentials);
+    const pendingRecovery = provider === "opencode"
+      && model.includes("-free")
+      && credentials.connectionId === "noauth"
+      && credentials.connectionName === "Public"
+      ? pendingOpenCodeProfileRecovery(profileProxy)
+      : null;
+    if (pendingRecovery) {
+      const recovery = await pendingRecovery;
+      if (recovery.state !== "ready" || recovery.handoff !== "verified") {
+        return { kind: "error", status: HTTP_STATUS.BAD_GATEWAY, message: "OpenCode profile recovery failed" };
+      }
+    }
+
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
@@ -420,14 +442,21 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
       // Lazily warms the in-process module on first use; null when not installed (fail-open)
       pxpipeTransform: chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null,
       onPxpipeEvent: appendPxpipeEvent,
-      onProviderError: ({ provider: errorProvider, model: errorModel, status, bodyText }) => {
+      skipOpenCodeRecoveryOnRateLimit: provider === "opencode"
+        && isGatedFreeTierRequest("zen", provider, model),
+      onProviderError: async ({ provider: errorProvider, model: errorModel, status, bodyText }) => {
         if (!isOpencodeFreeTierRateLimitForProvider(errorProvider, status, bodyText)
           || !isGatedFreeTierRequest("zen", errorProvider, errorModel)) return;
         opencodeFreeTierRateLimited = true;
-        refreshOpenCodeProfile({ proxyOptions: profileProxyOptions(refreshedCredentials) })
-          .then((profile) => log.info("OPENCODE_PROFILE", `${errorProvider}/${errorModel} | automatic refresh: ${profile.state}`))
-          .catch((error) => log.warn("OPENCODE_PROFILE", `automatic refresh failed: ${error.message}`));
+        recoverOpenCodeProfile({
+          credentials: refreshedCredentials,
+          proxyOptions: profileProxyOptions(refreshedCredentials),
+          force: true,
+        })
+          .then((profile) => log.info("OPENCODE_PROFILE", `${errorProvider}/${errorModel} | automatic profile recovery: ${profile.state}/${profile.handoff}`))
+          .catch(() => log.warn("OPENCODE_PROFILE", "automatic profile recovery failed"));
         log.warn("OPENCODE_PROFILE", `${errorProvider}/${errorModel} | 429 classified; returning upstream response without retry`);
+        return { preserveResponse: true };
       },
       providerThinking,
       // Per-provider user overrides (custom headers / connect timeout) from settings

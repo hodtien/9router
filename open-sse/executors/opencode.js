@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import path from "node:path";
 import { BaseExecutor } from "./base.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { PROVIDERS } from "../config/providers.js";
@@ -28,6 +29,16 @@ import {
 } from "./opencodeGeoBlock.js";
 
 const OPENCODE_UA = "opencode/1.18.31";
+// Stable, non-sensitive boundaries the OpenCode profile probe maps to a probe
+// stage. Only the code crosses that boundary — never stderr, exit text or raw
+// upstream bytes. stderr rides along non-enumerable so operators keep it in
+// server logs while JSON.stringify()/NextResponse cannot leak it.
+function transportError(message, code = null, detail = null) {
+  const error = new Error(message);
+  if (code) error.code = code;
+  if (detail !== null) Object.defineProperty(error, "stderr", { value: detail, enumerable: false });
+  return error;
+}
 const MAX_TOOL_NAME_LEN = 128;
 const MAX_SESSION_LENGTH = 256;
 const SESSION_HEADER = "x-opencode-session";
@@ -171,11 +182,16 @@ function nativeSession(headers) {
 }
 
 const stableOpencodeSessions = new Map();
+const publicSessionOverrides = new Map();
 const MAX_STABLE_SESSIONS = 1000;
+const MAX_PUBLIC_SESSION_OVERRIDES = 32;
 const stableSessionCleanup = setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of stableOpencodeSessions) {
     if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) stableOpencodeSessions.delete(key);
+  }
+  for (const [key, entry] of publicSessionOverrides) {
+    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) publicSessionOverrides.delete(key);
   }
 }, MEMORY_CONFIG.sessionCleanupIntervalMs);
 if (stableSessionCleanup.unref) stableSessionCleanup.unref();
@@ -187,6 +203,58 @@ function identityKey(credentials) {
   const auth = raw.authorization || raw.Authorization || raw["x-api-key"] || raw["X-Api-Key"] || "";
   if (auth) return `opencode:auth:${crypto.createHash("sha256").update(String(auth)).digest("hex").slice(0, 32)}`;
   return "opencode:default";
+}
+
+function publicProxyKey(credentials) {
+  if (credentials?.connectionId !== "noauth" || credentials?.connectionName !== "Public") return null;
+  const data = credentials.providerSpecificData || {};
+  if (data.connectionProxyEnabled !== true || data.strictProxy !== true || data.vercelRelayUrl) return null;
+
+  const rawUrl = data.connectionProxyUrl;
+  if (typeof rawUrl !== "string" || !rawUrl) return null;
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (!(["http:", "https:"].includes(url.protocol)) || !url.hostname || url.port !== "8900") return null;
+
+  const pool = data.connectionProxyPoolId || `${url.protocol}//${url.host}`;
+  return `${identityKey(credentials)}:proxy:${crypto.createHash("sha256").update(String(pool)).digest("hex").slice(0, 24)}`;
+}
+
+export function supportsPublicSessionRefresh(credentials) {
+  return publicProxyKey(credentials) !== null;
+}
+
+export function createPublicSessionCandidate(credentials) {
+  const key = publicProxyKey(credentials);
+  return key ? { key, sessionId: generateSessionId() } : null;
+}
+
+export function publishPublicSessionCandidate(candidate) {
+  if (!candidate?.key || !OPENCODE_SESSION_RE.test(candidate.sessionId || "")) return false;
+  if (publicSessionOverrides.size >= MAX_PUBLIC_SESSION_OVERRIDES) {
+    publicSessionOverrides.delete(publicSessionOverrides.keys().next().value);
+  }
+  if (publicSessionOverrides.has(candidate.key)) publicSessionOverrides.delete(candidate.key);
+  publicSessionOverrides.set(candidate.key, { sessionId: candidate.sessionId, lastUsed: Date.now() });
+  return true;
+}
+
+export function activePublicSessionId(credentials) {
+  const key = publicProxyKey(credentials);
+  if (!key) return null;
+  const entry = publicSessionOverrides.get(key);
+  if (!entry) return null;
+  const now = Date.now();
+  if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) {
+    publicSessionOverrides.delete(key);
+    return null;
+  }
+  entry.lastUsed = now;
+  return entry.sessionId;
 }
 
 export function stableSessionId(credentials) {
@@ -290,8 +358,13 @@ function addUpstreamDecoys(body, requestFormat, appendExisting = false) {
   if (requestFormat === "openai") cloakOpencodeTools(body, false);
 }
 
-function resolveOpencodeSession(body, credentials, providerSessionId, clientTool) {
+function resolveOpencodeSession(body, credentials, providerSessionId, clientTool, forcePublicSession = false) {
   const headers = credentials?.rawHeaders || {};
+  const hinted = normalizeSession(providerSessionId);
+  if (forcePublicSession && hinted) return translateSessionId(hinted, clientTool);
+  const publicOverride = activePublicSessionId(credentials);
+  if (publicOverride) return publicOverride;
+
   const native = nativeSession(headers);
   if (native) return native;
 
@@ -303,7 +376,7 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     }
   }
 
-  const hinted = incoming || normalizeSession(providerSessionId);
+  if (incoming) return translateSessionId(incoming, clientTool);
   if (hinted) return translateSessionId(hinted, clientTool);
   if (credentials?.connectionId || body?.session_id || body?.conversation_id || body?.prompt_cache_key) {
     const resolved = resolveSessionId({ headers, body, connectionId: credentials?.connectionId, scope: "opencode" });
@@ -410,7 +483,7 @@ export class OpenCodeExecutor extends BaseExecutor {
   // between concurrent requests on the singleton executor.
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
     const sourceCredentials = credentials || {};
-    const resolved = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool);
+    const resolved = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool, sourceCredentials.connectionId === "noauth" && sourceCredentials.connectionName === "Public" && clientTool === "opencode");
 
     return {
       ...sourceCredentials,
@@ -541,6 +614,7 @@ export class OpenCodeExecutor extends BaseExecutor {
   async execute(args = {}) {
     const { model, body, credentials = {}, signal } = args;
     const canRecover = !args?._opencodeRecoveryAttempt
+      && args?.skipOpenCodeRecoveryOnRateLimit !== true
       && isGatedFreeTierRequest("zen", this.provider, model)
       && !signal?.aborted;
 
@@ -550,6 +624,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       || first.response.status === 451;
 
     if (!canRecover || !retryableStatus) return first;
+    if (args?.skipOpenCodeRecoveryOnRateLimit && first.response.status === 429) return first;
 
     let refusalBody;
     try {
@@ -638,8 +713,20 @@ export class OpenCodeExecutor extends BaseExecutor {
       return response === result.response ? result : { ...result, response };
     };
 
+    const fs = await import("node:fs");
     const configuredFetcher = process.env.OPENCODE_FETCHER_PATH?.trim();
-    if (!configuredFetcher) {
+    const runtimeRoot = process.cwd();
+    // ponytail: Next.js rewrites `import.meta.url` so the inlined path is
+    // useless at runtime. Resolve the fetcher from explicit configuration or
+    // beside the packaged server before trying development-only paths.
+    const candidates = [
+      configuredFetcher,
+      path.join(runtimeRoot, "_opencode-fetcher.js"),
+    ].filter(Boolean);
+    const scriptPath = candidates.find((p) => {
+      try { return fs.statSync(p).isFile(); } catch { return false; }
+    });
+    if (!scriptPath && !configuredFetcher) {
       const rawResponse = await proxyAwareFetch(url, {
         method: "POST",
         headers,
@@ -648,24 +735,17 @@ export class OpenCodeExecutor extends BaseExecutor {
       }, proxyOptions || null);
       return finalize({ response: rawResponse, url, headers, transformedBody });
     }
-
-    const bunBin = process.env.BUN_BIN?.trim() || "bun";
-    // ponytail: Next.js rewrites `import.meta.url` so the inlined path is
-    // useless at runtime. Resolve the fetcher script from OPENCODE_FETCHER_PATH
-    // (preferred) or fall back to the repo-relative location so a symlink or
-    // copy placed at that path also works.
-    const candidates = [
-      process.env.OPENCODE_FETCHER_PATH?.trim(),
-      "/Users/hodtien/Desktop/sourcecodes/github-code/9router/open-sse/executors/_opencode-fetcher.js",
-      "/Users/hodtien/Desktop/sourcecodes/github-code/9router/cli/app/open-sse/executors/_opencode-fetcher.js",
-    ].filter(Boolean);
-    const fs = await import("node:fs");
-    const scriptPath = candidates.find((p) => {
-      try { return fs.statSync(p).isFile(); } catch { return false; }
-    });
     if (!scriptPath) {
-      throw new Error(`opencode Bun fetcher: script not found. Tried: ${candidates.join(", ")}. Set OPENCODE_FETCHER_PATH or copy _opencode-fetcher.js into cli/app.`);
+      throw transportError("opencode Bun fetcher: script not found", "OPENCODE_TRANSPORT_SPAWN");
     }
+
+    // ponytail: an unusable BUN_BIN (stale/guarded path like /root/.bun under a
+    // sandboxed service user) must not shadow a working runtime beside the app.
+    const bundledBun = path.join(runtimeRoot, ".runtime", "bun");
+    const bunBin = [process.env.BUN_BIN?.trim(), bundledBun].find((candidate) => {
+      if (!candidate) return false;
+      try { return fs.statSync(candidate).isFile(); } catch { return false; }
+    }) || "bun";
 
     // Hoisted so the child-process `close` handlers below can read it: `input`
     // is the JSON *string* written to stdin, so `input.strictProxy` is always
@@ -681,13 +761,18 @@ export class OpenCodeExecutor extends BaseExecutor {
       vercelRelayUrl: proxyOptions?.vercelRelayUrl || "",
     });
 
-    const child = (await import("node:child_process")).spawn(bunBin, ["--cwd=/tmp", scriptPath], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-      // ponytail: Bun refuses to run when its captured parent-cwd was deleted
-      // (e.g. after a deploy rotated /opt/groxy/app). Pin Bun's internal cwd
-      // to /tmp via --cwd= so the spawn survives such rotations.
-    });
+    let child;
+    try {
+      child = (await import("node:child_process")).spawn(bunBin, ["--cwd=/tmp", scriptPath], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
+        // ponytail: Bun refuses to run when its captured parent-cwd was deleted
+        // (e.g. after a deploy rotated /opt/groxy/app). Pin Bun's internal cwd
+        // to /tmp via --cwd= so the spawn survives such rotations.
+      });
+    } catch (error) {
+      throw transportError(`opencode Bun fetcher: spawn failed (${error?.code || "ENOENT"})`, "OPENCODE_TRANSPORT_SPAWN");
+    }
 
     if (signal) {
       const onAbort = () => { if (!child.killed) child.kill("SIGTERM"); };
@@ -721,10 +806,18 @@ export class OpenCodeExecutor extends BaseExecutor {
           try {
             metadata = JSON.parse(headerBuf.slice(0, nl).toString("utf8"));
           } catch (error) {
-            reject(new Error(`opencode Bun fetcher: bad metadata: ${error.message}`));
+            ended = true;
+            if (!child.killed) child.kill("SIGTERM");
+            reject(transportError("opencode Bun fetcher: bad metadata", "OPENCODE_TRANSPORT_METADATA"));
             return;
           }
           const tail = headerBuf.slice(nl + 1);
+          if (!metadata || !Number.isInteger(metadata.status)) {
+            ended = true;
+            if (!child.killed) child.kill("SIGTERM");
+            reject(transportError("opencode Bun fetcher: incomplete metadata", "OPENCODE_TRANSPORT_METADATA"));
+            return;
+          }
           const responseBody = new ReadableStream({
             start(streamController) {
               controller = streamController;
@@ -744,16 +837,21 @@ export class OpenCodeExecutor extends BaseExecutor {
         child.on("error", (error) => {
           if (ended) return;
           ended = true;
+          // Node only emits `error` when the process could not be spawned, and
+          // never after it started — so pre-metadata is a spawn failure, while a
+          // running child surfaces through `close` below.
           if (controller) controller.error(error);
-          else reject(error);
+          else reject(transportError(`opencode Bun fetcher: spawn failed (${error?.code || "ENOENT"})`, "OPENCODE_TRANSPORT_SPAWN"));
         });
         child.on("close", (code) => {
           if (ended) return;
           ended = true;
           if (!controller) {
-            reject(new Error(`opencode Bun fetcher exited before metadata (exit=${code}) stderr=${stderr.slice(0, 500)}`));
+            reject(transportError(`opencode Bun fetcher exited before metadata (exit=${code})`, "OPENCODE_TRANSPORT_METADATA", stderr.slice(0, 500)));
           } else if (code !== 0) {
-            controller.error(new Error(`opencode Bun fetcher exit=${code} stderr=${stderr.slice(0, 500)}`));
+            // Metadata already resolved, so this is a mid-stream failure: the
+            // body read rejects and the caller classifies it as a stream fault.
+            controller.error(transportError(`opencode Bun fetcher exit=${code}`, null, stderr.slice(0, 500)));
           } else {
             controller.close();
           }
@@ -767,15 +865,20 @@ export class OpenCodeExecutor extends BaseExecutor {
     child.stdout.on("data", (c) => stdoutChunks.push(c));
     child.stderr.on("data", (c) => stderrChunks.push(c));
     return new Promise((resolve, reject) => {
-      child.on("error", reject);
+      child.on("error", (error) => reject(transportError(`opencode Bun fetcher: spawn failed (${error?.code || "ENOENT"})`, "OPENCODE_TRANSPORT_SPAWN")));
       child.on("close", (code) => {
         const stderr = Buffer.concat(stderrChunks).toString("utf8").slice(0, 500);
         if (code === 0) {
+          // The child's whole stdout is its metadata envelope, so an unparseable
+          // or incomplete one is a metadata failure rather than a stream fault.
           let parsed;
           try {
             parsed = JSON.parse(Buffer.concat(stdoutChunks).toString("utf8"));
-          } catch (e) {
-            return reject(new Error(`opencode Bun fetcher: bad JSON output: ${e.message}`));
+          } catch {
+            return reject(transportError("opencode Bun fetcher: bad JSON output", "OPENCODE_TRANSPORT_METADATA", stderr));
+          }
+          if (!parsed || !Number.isInteger(parsed.status)) {
+            return reject(transportError("opencode Bun fetcher: incomplete metadata", "OPENCODE_TRANSPORT_METADATA", stderr));
           }
           return resolve(finalize({
             response: new Response(parsed.body, {
@@ -793,7 +896,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         // different code path on the same IP. A strict proxy request must not
         // take this fallback because the Node child cannot guarantee proxy use.
         if (strictProxy) {
-          return reject(new Error(`opencode Bun fetcher exit=${code} with strict proxy enabled`));
+          return reject(transportError(`opencode Bun fetcher exit=${code} with strict proxy enabled`, "OPENCODE_TRANSPORT_METADATA", stderr));
         }
         return tryNodeFallback({ resolve: (result) => resolve(finalize(result)), reject, input, url, headers, transformedBody, bunCode: code, bunStderr: stderr });
       });
@@ -810,10 +913,10 @@ async function tryNodeFallback({ resolve, reject, input, url, headers, transform
     || "/opt/groxy/app/_opencode-fetcher.mjs";
   const fs = await import("node:fs");
   if (!fs.existsSync(nodeFallback)) {
-    const msg = bunStatus
-      ? `opencode Bun fetcher HTTP ${bunStatus}: ${bunBody?.slice(0, 300)}`
-      : `opencode Bun fetcher exit=${bunCode} stderr=${bunStderr}`;
-    return reject(new Error(msg));
+    if (bunStatus) {
+      return reject(transportError(`opencode Bun fetcher HTTP ${bunStatus}`, "OPENCODE_TRANSPORT_METADATA", bunBody?.slice(0, 300)));
+    }
+    return reject(transportError(`opencode Bun fetcher exit=${bunCode}`, "OPENCODE_TRANSPORT_METADATA", bunStderr));
   }
   const cp = await import("node:child_process");
   const nodeChild = cp.spawn(process.execPath, [nodeFallback], {
@@ -825,16 +928,16 @@ async function tryNodeFallback({ resolve, reject, input, url, headers, transform
   const err = [];
   nodeChild.stdout.on("data", (c) => out.push(c));
   nodeChild.stderr.on("data", (c) => err.push(c));
-  nodeChild.on("error", () => reject(new Error(`node-fallback spawn error`)));
+  nodeChild.on("error", () => reject(transportError("node-fallback spawn error", "OPENCODE_TRANSPORT_SPAWN")));
   nodeChild.on("close", (ncode) => {
     if (ncode !== 0) {
-      return reject(new Error(`opencode node-fallback exit=${ncode} stderr=${Buffer.concat(err).toString("utf8").slice(0, 500)}`));
+      return reject(transportError(`opencode node-fallback exit=${ncode}`, "OPENCODE_TRANSPORT_METADATA", Buffer.concat(err).toString("utf8").slice(0, 500)));
     }
     let parsed;
     try {
       parsed = JSON.parse(Buffer.concat(out).toString("utf8"));
-    } catch (e) {
-      return reject(new Error(`opencode node-fetcher: bad JSON output: ${e.message}`));
+    } catch {
+      return reject(transportError("opencode node-fetcher: bad JSON output", "OPENCODE_TRANSPORT_METADATA"));
     }
     resolve({
       response: new Response(parsed.body, {

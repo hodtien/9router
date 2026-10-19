@@ -37,6 +37,13 @@ export function copyStandaloneAssets({ projectRoot = process.cwd(), distDir = pr
     cpSync(serverWrapperSource, serverWrapperDestination, { force: true });
     console.log(`[standalone-assets] Copied custom-server.js to ${serverWrapperDestination}`);
   }
+
+  const fetcherSource = resolve(projectRoot, "open-sse", "executors", "_opencode-fetcher.js");
+  const fetcherDestination = resolve(standaloneDir, "_opencode-fetcher.js");
+  if (existsSync(fetcherSource)) {
+    cpSync(fetcherSource, fetcherDestination, { force: true });
+    console.log(`[standalone-assets] Copied _opencode-fetcher.js to ${fetcherDestination}`);
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(dirname(fileURLToPath(import.meta.url)), "copy-standalone-assets.mjs")) {

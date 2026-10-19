@@ -43,6 +43,7 @@ describe("OpenCode streaming transport status", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     delete process.env.OPENCODE_FETCHER_PATH;
+    delete process.env.BUN_BIN;
   });
 
   it("waits for Bun metadata before constructing the upstream Response", async () => {
@@ -91,6 +92,22 @@ describe("OpenCode streaming transport status", () => {
       object: "chat.completion",
       choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
     });
+  });
+
+  it("kills the child when stream metadata is malformed", async () => {
+    const child = makeChild(200, "");
+    child.stdin.end = vi.fn(() => queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from("not-json\ndata"));
+      child.emit("close", 0);
+      child.stdout.emit("data", Buffer.from("late data"));
+    }));
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    await expect(new OpenCodeExecutor().execute({
+      model: "mimo-v2.5-free", body: { messages: [] }, stream: true, credentials: {},
+    })).rejects.toThrow(/bad metadata/i);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
   it("drains stdout arriving after process exit before closing the stream", async () => {
@@ -358,7 +375,7 @@ describe("OpenCode streaming transport status", () => {
     const sse = [
       'event: response.created\ndata: {"type":"response.created","response":{"id":"resp-1","created_at":1}}',
       'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}',
-      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}',
       "",
     ].join("\n\n");
     mocks.spawn.mockReturnValue(makeChild(200, sse, { "content-type": "text/event-stream" }, inputs));
@@ -400,5 +417,96 @@ describe("OpenCode streaming transport status", () => {
     expect(inputs[0].headers.Accept).toBe("*/*");
     expect(JSON.parse(inputs[0].body)).toMatchObject({ stream: false });
     expect(JSON.parse(inputs[0].body)).not.toHaveProperty("tools");
+  });
+
+  // The profile probe maps these two codes to probe stages; everything else it
+  // sees must stay an unclassified transport failure.
+  it("tags a child that never starts with the spawn code and no stderr", async () => {
+    const child = makeChild(200, "");
+    child.stdin.end = vi.fn(() => queueMicrotask(() => {
+      child.emit("error", Object.assign(new Error("spawn bun ENOENT"), { code: "ENOENT" }));
+    }));
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    const error = await new OpenCodeExecutor().execute({
+      model: "muse-spark-1.3-contributor-free", body: { input: [] }, stream: true, credentials: {},
+    }).catch((e) => e);
+
+    expect(error.code).toBe("OPENCODE_TRANSPORT_SPAWN");
+    expect(JSON.stringify(error)).not.toContain("spawn bun ENOENT");
+    expect(error.stderr).toBeUndefined();
+  });
+
+  it("tags a child that exits before metadata with the metadata code", async () => {
+    const child = makeChild(200, "");
+    child.stdin.end = vi.fn(() => queueMicrotask(() => {
+      child.stderr.emit("data", Buffer.from("fatal: fingerprint rejected"));
+      child.emit("close", 1);
+    }));
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    const error = await new OpenCodeExecutor().execute({
+      model: "muse-spark-1.3-contributor-free", body: { input: [] }, stream: true, credentials: {},
+    }).catch((e) => e);
+
+    expect(error.code).toBe("OPENCODE_TRANSPORT_METADATA");
+    expect(error.message).toContain("exit=1");
+    expect(JSON.stringify(error)).not.toContain("fingerprint rejected");
+    expect(error.stderr).toContain("fingerprint rejected");
+  });
+
+  it("spawns a usable Bun runtime when BUN_BIN points at a path the service cannot run", async () => {
+    // Regression: staging ran as a sandboxed user with BUN_BIN=/root/.bun/bin/bun
+    // (ProtectHome), so spawn failed EACCES while a working runtime sat beside the app.
+    const child = makeChild(200, "");
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+    process.env.BUN_BIN = "/nonexistent-path-for-groxy-stage/bun";
+
+    const result = await new OpenCodeExecutor().execute({
+      model: "muse-spark-1.3-contributor-free", body: { input: [] }, stream: true, credentials: {},
+    });
+
+    const [bin, args] = mocks.spawn.mock.calls[0];
+    expect(bin).not.toBe("/nonexistent-path-for-groxy-stage/bun");
+    expect(bin.endsWith("bun")).toBe(true);
+    expect(args[1]).toBe(process.env.OPENCODE_FETCHER_PATH);
+    expect(result.response.status).toBe(200);
+  });
+
+  it("tags metadata without a numeric status with the metadata code", async () => {
+    const child = makeChild(200, "");
+    child.stdin.end = vi.fn(() => queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from('{"headers":{}}\ndata'));
+    }));
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    const error = await new OpenCodeExecutor().execute({
+      model: "muse-spark-1.3-contributor-free", body: { input: [] }, stream: true, credentials: {},
+    }).catch((e) => e);
+
+    expect(error.code).toBe("OPENCODE_TRANSPORT_METADATA");
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("errors the body — not the execute call — when the child dies after metadata", async () => {
+    const child = makeChild(200, "");
+    child.stdin.end = vi.fn(() => queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from('{"status":200,"headers":{"content-type":"text/event-stream"}}\npartial'));
+      child.emit("close", 1);
+    }));
+    mocks.spawn.mockReturnValue(child);
+    process.env.OPENCODE_FETCHER_PATH = new URL("../../open-sse/executors/_opencode-fetcher.js", import.meta.url).pathname;
+
+    const result = await new OpenCodeExecutor().execute({
+      model: "muse-spark-1.3-contributor-free", body: { input: [] }, stream: true, credentials: {},
+    });
+
+    expect(result.response.status).toBe(200);
+    // No code: the recovery layer classifies this as a stream fault, not transport.
+    await expect(result.response.text()).rejects.toThrow(/exit=1/);
   });
 });

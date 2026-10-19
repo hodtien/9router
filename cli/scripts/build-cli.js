@@ -222,6 +222,13 @@ function buildCliPackage() {
     process.exit(1);
   }
 
+  // The OpenCode free-tier executor shells out to Bun; keep its fetcher beside server.js.
+  const opencodeFetcherSrc = path.join(appDir, "open-sse", "executors", "_opencode-fetcher.js");
+  if (fs.existsSync(opencodeFetcherSrc)) {
+    fs.copyFileSync(opencodeFetcherSrc, path.join(cliAppDir, "_opencode-fetcher.js"));
+    console.log("✅ Copied _opencode-fetcher.js\n");
+  }
+
   // Step 3b: Ensure sql.js (pure JS fallback) bundled in app/cli/app/node_modules.
   // Strip better-sqlite3 (native) — it lives in ~/.9router/runtime to avoid
   // Windows EBUSY during global CLI updates. node:sqlite (Node ≥22.5) is also

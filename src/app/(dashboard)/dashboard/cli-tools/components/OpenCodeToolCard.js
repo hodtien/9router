@@ -137,17 +137,23 @@ export default function OpenCodeToolCard({ tool, isExpanded, onToggle, baseUrl, 
       const data = await res.json();
       setProfileStatus(data);
       setMessage({
-        type: res.ok ? "success" : "error",
-        text: data.state === "direct-egress"
-          ? "OpenCode is using the direct IP; a new profile will not clear its 429 bucket."
-          : data.state === "cooldown"
-            ? "A profile refresh is already within its cooldown window."
-            : res.ok
-              ? `Profile probe: ${data.state} (HTTP handoff remains ${data.handoff}).`
-              : "OpenCode profile refresh failed.",
+        type: res.ok && data.state === "ready" && data.handoff === "verified" ? "success" : "error",
+        text: data.state === "ready" && data.handoff === "verified"
+          ? "OpenCode profile refresh completed and the session handoff was verified."
+          : data.state === "direct-egress"
+            ? "OpenCode Public has no strict proxy; profile refresh was not run."
+            : data.state === "proxy-not-supported" || data.state === "proxy-not-strict"
+              ? "Profile refresh requires the strict proxy pool on port 8900."
+              : data.state === "unsupported"
+                ? "OpenCode profile refresh is unsupported because this gateway does not manage the OpenCode CLI profile."
+                : data.state === "cooldown"
+                  ? "Profile refresh is in its cooldown window; no refresh was run."
+                  : data.state === "failed"
+                    ? "OpenCode profile refresh failed; no verified handoff was created."
+                    : "OpenCode profile refresh is unavailable.",
       });
-    } catch (error) {
-      setMessage({ type: "error", text: error.message });
+    } catch {
+      setMessage({ type: "error", text: "OpenCode profile refresh is unavailable." });
     } finally {
       setRefreshingProfile(false);
     }
@@ -483,7 +489,7 @@ export default function OpenCodeToolCard({ tool, isExpanded, onToggle, baseUrl, 
               </div>
               {profileStatus && (
                 <div className="text-xs text-text-muted">
-                  Profile: {profileStatus.state} · proxy: {profileStatus.proxy} · handoff: {profileStatus.handoff}
+                  Profile refresh: {profileStatus.state} · handoff: {profileStatus.handoff === "verified" ? "verified" : "unverified"}
                 </div>
               )}
             </>
