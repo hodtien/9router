@@ -6,9 +6,8 @@ import Modal from "@/shared/components/Modal";
 import Input from "@/shared/components/Input";
 import Button from "@/shared/components/Button";
 import Badge from "@/shared/components/Badge";
-import ModelSelectModal from "@/shared/components/ModelSelectModal";
+import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 import Select from "@/shared/components/Select";
-import { getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 
 export default function EditConnectionModal({ isOpen, connection, proxyPools, onSave, onClose }) {
   const [formData, setFormData] = useState({
@@ -23,74 +22,59 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
     organization: "",
   });
   const [cloudflareData, setCloudflareData] = useState({ accountId: "" });
+  const [awsData, setAwsData] = useState({ profile: "", region: "", accessKeyId: "", sessionToken: "" });
+  const [clearAwsSessionToken, setClearAwsSessionToken] = useState(false);
   const [region, setRegion] = useState("");
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const [validating, setValidating] = useState(false);
   const [validationResult, setValidationResult] = useState(null);
   const [saving, setSaving] = useState(false);
-  const [allowedModels, setAllowedModels] = useState([]);
-  const [showAllowedModelsPicker, setShowAllowedModelsPicker] = useState(false);
-  const [modelAliases, setModelAliases] = useState({});
-  const [activeProviders, setActiveProviders] = useState([]);
 
   useEffect(() => {
-    if (!connection) return;
-    setFormData({
-      name: connection.name || "",
-      priority: connection.priority || 1,
-      apiKey: "",
-    });
-    if (connection.provider === "azure" && connection.providerSpecificData) {
-      setAzureData({
-        azureEndpoint: connection.providerSpecificData.azureEndpoint || "",
-        apiVersion: connection.providerSpecificData.apiVersion || "2024-10-01-preview",
-        deployment: connection.providerSpecificData.deployment || "",
-        organization: connection.providerSpecificData.organization || "",
+    if (connection) {
+      setFormData({
+        name: connection.name || "",
+        priority: connection.priority || 1,
+        apiKey: "",
       });
+      // Load Azure-specific data if present
+      if (connection.provider === "azure" && connection.providerSpecificData) {
+        setAzureData({
+          azureEndpoint: connection.providerSpecificData.azureEndpoint || "",
+          apiVersion: connection.providerSpecificData.apiVersion || "2024-10-01-preview",
+          deployment: connection.providerSpecificData.deployment || "",
+          organization: connection.providerSpecificData.organization || "",
+        });
+      }
+      if (connection.provider === "cloudflare-ai" && connection.providerSpecificData) {
+        setCloudflareData({ accountId: connection.providerSpecificData.accountId || "" });
+      }
+      if (AI_PROVIDERS?.[connection.provider]?.credentialForm === "aws") {
+        const psd = connection.providerSpecificData || {};
+        setAwsData({
+          profile: psd.profile || "",
+          region: psd.region || "",
+          accessKeyId: psd.accessKeyId || "",
+          sessionToken: "",
+        });
+        setClearAwsSessionToken(false);
+      }
+      // Load region for providers that support it (e.g. xiaomi-tokenplan)
+      const providerCfg = AI_PROVIDERS?.[connection.provider];
+      if (providerCfg?.regions) {
+        const savedRegion = connection.providerSpecificData?.region || providerCfg.defaultRegion || providerCfg.regions[0]?.id || "";
+        setRegion(savedRegion);
+      }
+      setTestResult(null);
+      setValidationResult(null);
     }
-    if (connection.provider === "cloudflare-ai" && connection.providerSpecificData) {
-      setCloudflareData({ accountId: connection.providerSpecificData.accountId || "" });
-    }
-    const providerCfg = AI_PROVIDERS?.[connection.provider];
-    if (providerCfg?.regions) {
-      const savedRegion = connection.providerSpecificData?.region || providerCfg.defaultRegion || providerCfg.regions[0]?.id || "";
-      setRegion(savedRegion);
-    }
-    setAllowedModels(Array.isArray(connection.allowedModels) ? connection.allowedModels : []);
-    setTestResult(null);
-    setValidationResult(null);
-  }, [connection]);
-
-  useEffect(() => {
-    if (!isOpen || !connection) return;
-    let cancelled = false;
-    const fetchAlias = fetch("/api/models/alias")
-      .then((r) => (r.ok ? r.json() : { aliases: {} }))
-      .then((d) => d.aliases || {})
-      .catch(() => ({}));
-    Promise.all([
-      fetchAlias,
-      fetch("/api/provider-nodes").then((r) => (r.ok ? r.json() : { nodes: [] })).catch(() => ({ nodes: [] })),
-    ]).then(([aliases, nodesRes]) => {
-      if (cancelled) return;
-      setModelAliases(aliases || {});
-      const node = (nodesRes.nodes || []).find((n) => n.id === connection.provider);
-      const displayPrefix = node?.prefix || connection.providerSpecificData?.prefix || getProviderAlias(connection.provider);
-      setActiveProviders([
-        {
-          provider: connection.provider,
-          name: node?.name || connection.provider,
-          providerSpecificData: { ...(connection.providerSpecificData || {}), prefix: displayPrefix },
-        },
-      ]);
-    });
-    return () => { cancelled = true; };
-  }, [isOpen, connection?.id, connection?.provider, connection?.providerSpecificData?.prefix]);
+  }, [connection, isOpen]);
 
   const isOAuth = connection?.authType === "oauth";
   const isAzure = connection?.provider === "azure";
   const isCloudflareAi = connection?.provider === "cloudflare-ai";
+  const usesAwsCredentialForm = AI_PROVIDERS?.[connection?.provider]?.credentialForm === "aws";
   const isCompatible = connection
     ? (isOpenAICompatibleProvider(connection.provider) || isAnthropicCompatibleProvider(connection.provider))
     : false;
@@ -101,6 +85,15 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
     if (providerRegions && region) return { ...((connection?.providerSpecificData) || {}), region };
     return undefined;
   };
+
+  // The server keeps a saved session token when this password field is blank. Other empty
+  // fields still clear their saved values so a profile can be switched to static keys.
+  const buildAwsSpecificData = () => ({
+    profile: awsData.profile.trim(),
+    region: awsData.region.trim(),
+    accessKeyId: awsData.accessKeyId.trim(),
+    sessionToken: clearAwsSessionToken ? null : awsData.sessionToken.trim(),
+  });
 
   const handleTest = async () => {
     if (!connection?.provider) return;
@@ -130,6 +123,7 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
           apiKey: formData.apiKey,
           ...(isAzure ? { providerSpecificData: azureData } : {}),
           ...(isCloudflareAi ? { providerSpecificData: cloudflareData } : {}),
+          ...(usesAwsCredentialForm ? { providerSpecificData: buildAwsSpecificData() } : {}),
           ...(providerRegions ? { providerSpecificData: buildRegionSpecificData() } : {}),
         }),
       });
@@ -149,9 +143,6 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
       const updates = {
         name: formData.name,
         priority: formData.priority,
-        // Always send an array. The PUT route normalizes an empty list to
-        // `null` server-side, and rejects a literal `null` with 400.
-        allowedModels,
       };
       if (!isOAuth && formData.apiKey) {
         updates.apiKey = formData.apiKey;
@@ -168,6 +159,7 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
                 apiKey: formData.apiKey,
                 ...(isAzure ? { providerSpecificData: azureData } : {}),
                 ...(isCloudflareAi ? { providerSpecificData: cloudflareData } : {}),
+                ...(usesAwsCredentialForm ? { providerSpecificData: buildAwsSpecificData() } : {}),
                 ...(providerRegions ? { providerSpecificData: buildRegionSpecificData() } : {}),
               }),
             });
@@ -199,6 +191,9 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
       if (isCloudflareAi) {
         updates.providerSpecificData = { accountId: cloudflareData.accountId };
       }
+      if (usesAwsCredentialForm) {
+        updates.providerSpecificData = buildAwsSpecificData();
+      }
       // Persist updated region for region-aware providers
       if (providerRegions && region) {
         updates.providerSpecificData = buildRegionSpecificData();
@@ -209,8 +204,6 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
       setSaving(false);
     }
   };
-
-  const displayModelAlias = (modelValue) => modelAliases[modelValue] || modelValue.split("/").pop();
 
   if (!connection) return null;
 
@@ -298,6 +291,53 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
           </div>
         )}
 
+        {usesAwsCredentialForm && (
+          <div className="bg-sidebar/50 p-4 rounded-lg border border-accent/20">
+            <h3 className="font-semibold mb-3 text-sm">AWS Bedrock Credentials</h3>
+            <div className="flex flex-col gap-3">
+              <Input
+                label="AWS Profile (SSO — recommended)"
+                value={awsData.profile}
+                onChange={(e) => setAwsData({ ...awsData, profile: e.target.value })}
+                placeholder="my-sso-profile"
+                hint="Clear this to use static keys instead; a profile takes precedence."
+              />
+              <Input
+                label="Region"
+                value={awsData.region}
+                onChange={(e) => setAwsData({ ...awsData, region: e.target.value })}
+                placeholder="us-east-1"
+              />
+              <Input
+                label="Access Key ID (only for static keys)"
+                value={awsData.accessKeyId}
+                onChange={(e) => setAwsData({ ...awsData, accessKeyId: e.target.value })}
+                placeholder="AKIA..."
+              />
+              <Input
+                label="Session Token (only for temporary ASIA… keys)"
+                type="password"
+                value={awsData.sessionToken}
+                onChange={(e) => setAwsData({ ...awsData, sessionToken: e.target.value })}
+                placeholder="FwoGZXIvYXdz..."
+                hint="Leave blank to keep the saved token. Enter a new token to replace it."
+                disabled={clearAwsSessionToken}
+              />
+              <label className="flex items-center gap-2 text-sm text-text-muted">
+                <input
+                  type="checkbox"
+                  checked={clearAwsSessionToken}
+                  onChange={(e) => {
+                    setClearAwsSessionToken(e.target.checked);
+                    if (e.target.checked) setAwsData({ ...awsData, sessionToken: "" });
+                  }}
+                />
+                Remove saved session token
+              </label>
+            </div>
+          </div>
+        )}
+
         {providerRegions && (
           <Select
             label="Region"
@@ -320,107 +360,6 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
           </div>
         )}
 
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold">Allowed Models</h3>
-            {allowedModels.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setAllowedModels([])}
-                className="text-xs text-text-muted hover:text-text-main"
-              >
-                Clear all
-              </button>
-            )}
-          </div>
-
-          {allowedModels.length === 0 ? (
-            <div className="bg-sidebar/50 p-3 rounded-lg flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium text-text-main">All models allowed</p>
-                <p className="text-xs text-text-muted">Restrict this account to a subset of provider models.</p>
-              </div>
-              <Button
-                size="sm"
-                variant="secondary"
-                icon="tune"
-                onClick={() => setShowAllowedModelsPicker(true)}
-              >
-                Configure Models
-              </Button>
-            </div>
-          ) : (
-            <>
-              <div
-                className="flex flex-col gap-1 max-h-[200px] overflow-y-auto rounded-lg border border-border p-2"
-                style={{ background: "var(--color-surface-2, #303030)" }}
-              >
-                {allowedModels.map((modelValue) => {
-                  const alias = displayModelAlias(modelValue);
-                  return (
-                    <div
-                      key={modelValue}
-                      className="flex items-center gap-2 px-2 py-1 rounded hover:bg-surface-3/40"
-                    >
-                      <span
-                        className="flex-1 font-mono text-xs text-text-main truncate"
-                        title={modelValue}
-                      >
-                        {alias}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setAllowedModels((current) => current.filter((m) => m !== modelValue))
-                        }
-                        className="text-text-muted hover:text-text-main"
-                        aria-label={`Remove ${alias}`}
-                      >
-                        <span className="material-symbols-outlined" style={{ fontSize: "14px" }}>close</span>
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-              <Button
-                size="sm"
-                variant="secondary"
-                icon="add"
-                onClick={() => setShowAllowedModelsPicker(true)}
-              >
-                Add Model
-              </Button>
-              <p className="text-xs text-text-muted flex items-center gap-1">
-                <span className="material-symbols-outlined" style={{ fontSize: "12px" }}>info</span>
-                Empty = all models allowed.
-              </p>
-            </>
-          )}
-        </div>
-
-        {showAllowedModelsPicker && (
-          <ModelSelectModal
-            isOpen
-            onClose={() => setShowAllowedModelsPicker(false)}
-            onSelect={(model) =>
-              setAllowedModels((current) =>
-                current.includes(model.value) ? current : [...current, model.value]
-              )
-            }
-            onDeselect={(model) =>
-              setAllowedModels((current) => current.filter((m) => m !== model.value))
-            }
-            addedModelValues={allowedModels}
-            closeOnSelect={false}
-            hideCombos
-            onlyActiveProviders
-            activeProviders={activeProviders}
-            modelAliases={modelAliases}
-            title="Allow Models for this Account"
-            kindFilter={null}
-          />
-        )}
-
         <div className="flex gap-2">
           <Button onClick={handleSubmit} fullWidth disabled={saving}>{saving ? "Saving..." : "Save"}</Button>
           <Button onClick={onClose} variant="ghost" fullWidth>Cancel</Button>
@@ -440,7 +379,6 @@ EditConnectionModal.propTypes = {
     authType: PropTypes.string,
     provider: PropTypes.string,
     providerSpecificData: PropTypes.object,
-    allowedModels: PropTypes.arrayOf(PropTypes.string),
   }),
   proxyPools: PropTypes.arrayOf(PropTypes.shape({
     id: PropTypes.string,
@@ -449,4 +387,3 @@ EditConnectionModal.propTypes = {
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
 };
-
