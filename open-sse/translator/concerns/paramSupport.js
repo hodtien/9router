@@ -39,9 +39,30 @@ const STRIP_RULES = [
     match: /(^|\/)fugu(-ultra)?(-[0-9]+)?$/i,
     dropReasoningObjectUnless: { field: "reasoning", allow: ["high", "xhigh", "max"] },
   },
+  // VolcEngine Ark caps the Kimi family at max_tokens <= 32768, but the model's
+  // advertised ceiling is far higher (Kimi-K2.7-Code resolves to maxOutput 262144),
+  // so clampToModelMaxOutput alone leaves it uncapped and the request 400s with
+  // "integer above maximum value, expected <= 32768". Pin an explicit endpoint cap;
+  // min() with the model ceiling still applies if a variant's own limit is lower.
+  { provider: "volcengine-ark", match: /kimi/i, maxOutputCap: 32768, clampToModelMaxOutput: true },
+  // Strict OpenAI-compatible validators reject unknown assistant-message fields.
+  // Clients that talk to reasoning models (e.g. Hermes) echo the prior turn's
+  // reasoning back on every assistant message; Groq answers 400 and Mistral 422
+  // ("extra_forbidden") on it, which knocks these providers out of every
+  // multi-turn combo. Providers that *require* the field (DeepSeek, Kimi) are
+  // handled by reasoningContentInjector and are not listed here.
   { provider: "groq", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
   { provider: "mistral", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
   { provider: "cerebras", dropMessageFields: ["reasoning_content", "reasoning", "reasoning_details"] },
+  // OpenCode Go's relay rejects `response_format` for its deepseek family with HTTP
+  // 400 — both json_schema and json_object — while glm / kimi / mimo / minimax /
+  // qwen / grok / gpt on the same relay accept it. The rejection body is either a
+  // bare model echo (`{"model":"deepseek-v4.1-flash"}`, which names neither the
+  // field nor the reason) or "This response_format type is unavailable now", so a
+  // client cannot classify it and keeps re-sending the field. Measured 2026-10-13
+  // against /zen/go/v1/chat/completions with one key: 12/12 structured calls 400,
+  // 4/4 identical calls without the field 200.
+  { provider: "opencode-go", match: /^deepseek/i, drop: ["response_format"] },
 ];
 
 // Enforce minimum values for params (e.g. max_tokens floor).
@@ -67,15 +88,6 @@ const MIN_RULES = [
     match: /qwen3\.8/i,
     min: { max_tokens: 3, max_completion_tokens: 3, max_output_tokens: 3 },
   },
-  // MiMo Desktop Preview models (account-service route): content must be plain string,
-  // rejects OpenAI content-part array. Cloud models keep their parts (mimo-v2-omni is multi-modal).
-  { provider: "xiaomi-mimo", match: /preview/i, flattenContent: true },
-  // VolcEngine Ark caps the Kimi family at max_tokens <= 32768, but the model's
-  // advertised ceiling is far higher (Kimi-K2.7-Code resolves to maxOutput 262144),
-  // so clampToModelMaxOutput alone leaves it uncapped and the request 400s with
-  // "integer above maximum value, expected <= 32768". Pin an explicit endpoint cap;
-  // min() with the model ceiling still applies if a variant's own limit is lower.
-  { provider: "volcengine-ark", match: /kimi/i, maxOutputCap: 32768, clampToModelMaxOutput: true },
 ];
 
 // Test a rule's match (regex or predicate) against the model id.
