@@ -58,6 +58,12 @@ export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_M
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
 
+// Bounded internal wait when every account for a provider is inside its cooldown.
+// The gateway retries after the earliest unlock instead of surfacing 429 to the client,
+// which stops one-shot callers (subagents) from dying on a transient full pool.
+// Capped so a genuinely exhausted pool still returns promptly. Env: ALL_ACCOUNTS_COOLDOWN_WAIT_MS (0 disables).
+export const ALL_ACCOUNTS_COOLDOWN_WAIT_MS = envMs("ALL_ACCOUNTS_COOLDOWN_WAIT_MS", 30 * 1000);
+
 // Cloudflare Free/Pro origin first-byte budget is ~100s. When the client request
 // arrives via CF (cf-ray header), cap connect timeout so connect + a retry still
 // fit under that window. Env: CF_SAFE_CONNECT_TIMEOUT_MS.

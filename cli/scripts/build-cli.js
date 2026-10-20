@@ -20,6 +20,7 @@ const EXCLUDE_PATTERNS = [
   ".env",           // Environment files
   ".env.local",
   ".env.*.local",
+  ".build-home",    // Build-time HOME with generated secrets
   "*.log",          // Log files
   "tmp",            // Temp files
   ".DS_Store",      // macOS files
@@ -250,6 +251,14 @@ function buildCliPackage() {
   // the bundle's node_modules or every importer throws MODULE_NOT_FOUND at runtime. Output
   // tracing normally copies it; this is the same belt-and-braces guard used for sql.js.
   ensureModuleInBundle("open");
+  // `@aws-sdk/credential-providers` is external for the same reason (reads ~/.aws at
+  // runtime, resolves plugins by dynamic require). Bedrock profile/SSO mode dies with
+  // MODULE_NOT_FOUND in the packaged CLI without it.
+  ensureModuleInBundle("@aws-sdk/credential-providers");
+  // `node-forge` (MITM cert generation) and `node-machine-id` (machine ID) are loaded
+  // at runtime by the MITM child process / standalone server, which tracing omits.
+  ensureModuleInBundle("node-forge");
+  ensureModuleInBundle("node-machine-id");
   const betterDir = path.join(cliAppDir, "node_modules", "better-sqlite3");
   if (fs.existsSync(betterDir)) {
     fs.rmSync(betterDir, { recursive: true, force: true });

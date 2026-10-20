@@ -183,7 +183,7 @@ describe("Kiro external_idp (CLIProxyAPI) import and refresh", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("adds CodeWhisperer external IdP headers and endpoint ordering", async () => {
+  it("adds external IdP headers and current endpoint ordering", async () => {
     const { KiroExecutor } = await import("../../open-sse/executors/kiro.js");
     const executor = new KiroExecutor();
     const credentials = {
@@ -197,7 +197,7 @@ describe("Kiro external_idp (CLIProxyAPI) import and refresh", () => {
     expect(headers.tokentype).toBeUndefined();
 
     expect(executor.buildUrl("claude-sonnet-4.5", true, 0, credentials)).toBe(
-      "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+      "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
     );
   });
 

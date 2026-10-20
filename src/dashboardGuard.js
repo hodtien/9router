@@ -45,6 +45,7 @@ const ALWAYS_PROTECTED = [
   "/api/version/update",
   "/api/oauth/cursor/auto-import",
   "/api/oauth/kiro/auto-import",
+  "/api/oauth/zed/auto-import",
 ];
 
 // Require auth, but allow through if requireLogin is disabled
@@ -82,6 +83,7 @@ const LOCAL_ONLY_PATHS = [
   "/api/tunnel/disable",
   "/api/oauth/cursor/auto-import",
   "/api/oauth/kiro/auto-import",
+  "/api/oauth/zed/auto-import",
   "/api/auth/reset-password",
   "/api/headroom/start",
   "/api/headroom/stop",
@@ -161,6 +163,12 @@ async function canAccessPublicLlmApi(request) {
 
 async function canAccessLocalOnlyRoute(request) {
   if (await hasValidCliToken(request)) return true;
+  if (
+    request.nextUrl.pathname === "/api/cli-tools/opencode-profile"
+    && request.method === "POST"
+    && request.headers.get("origin") === request.nextUrl.origin
+    && await hasValidToken(request)
+  ) return true;
   // Browser on host: loopback Host + Origin (blocks tunnel/CSRF) + auth (JWT or requireLogin=false)
   if (isLocalRequest(request) && await isAuthenticated(request)) return true;
   return false;
@@ -191,6 +199,9 @@ function isPublicApi(pathname) {
   if (isPublicLlmApi(pathname)) return true;
   return PUBLIC_API_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 }
+
+// Shared with src/proxy.js — the mimo login branch must respect dashboard auth.
+export { isAuthenticated };
 
 export const __test__ = {
   isLocalRequest,
