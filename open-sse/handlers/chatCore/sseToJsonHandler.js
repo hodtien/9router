@@ -3,10 +3,14 @@ import { restoreToolNames } from "../../utils/opencodeFingerprint.js";
 import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { FORMATS } from "../../translator/formats.js";
+import { openAICompletionToClaudeMessage } from "../../translator/concerns/claudeMessage.js";
 import { PROVIDERS } from "../../config/providers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { applyKiroCacheAccounting } from "../../utils/kiroCacheTracker.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { parseSSEToOpenAIResponse } from "../sseParser.js";
+
+export { parseSSEToOpenAIResponse } from "../sseParser.js";
 
 // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
 const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
@@ -105,76 +109,6 @@ function chatCompletionToResponses(responseBody, customToolNames = null) {
       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
     },
   };
-}
-
-/**
- * Parse OpenAI-style SSE text into a single chat completion JSON.
- * Used when provider forces streaming but client wants non-streaming.
- */
-export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
-  const chunks = [];
-  let streamError = null;
-
-  for (const line of String(rawSSE || "").split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) continue;
-    const payload = trimmed.slice(5).trim();
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      const chunk = JSON.parse(payload);
-      if (chunk?.error) streamError = chunk.error;
-      else chunks.push(chunk);
-    } catch { /* ignore malformed lines */ }
-  }
-
-  if (streamError) return { error: streamError };
-  if (chunks.length === 0) return null;
-
-  const first = chunks[0];
-  const contentParts = [];
-  const reasoningParts = [];
-  const toolCallMap = new Map(); // index -> { id, type, function: { name, arguments } }
-  let finishReason = "stop";
-  let usage = null;
-
-  for (const chunk of chunks) {
-    const choice = chunk?.choices?.[0];
-    const delta = choice?.delta || {};
-    if (typeof delta.content === "string" && delta.content.length > 0) contentParts.push(delta.content);
-    if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) reasoningParts.push(delta.reasoning_content);
-    if (choice?.finish_reason) finishReason = choice.finish_reason;
-    if (chunk?.usage && typeof chunk.usage === "object") usage = chunk.usage;
-
-    // Accumulate tool_calls from streaming deltas
-    if (Array.isArray(delta.tool_calls)) {
-      for (const tc of delta.tool_calls) {
-        const idx = tc.index ?? 0;
-        if (!toolCallMap.has(idx)) {
-          toolCallMap.set(idx, { id: tc.id || "", type: "function", function: { name: "", arguments: "" } });
-        }
-        const existing = toolCallMap.get(idx);
-        if (tc.id) existing.id = tc.id;
-        if (tc.function?.name) existing.function.name += tc.function.name;
-        if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
-      }
-    }
-  }
-
-  const message = { role: "assistant", content: contentParts.join("") || (toolCallMap.size > 0 ? null : "") };
-  if (reasoningParts.length > 0) message.reasoning_content = reasoningParts.join("");
-  if (toolCallMap.size > 0) {
-    message.tool_calls = [...toolCallMap.entries()].sort((a, b) => a[0] - b[0]).map(([, tc]) => tc);
-  }
-
-  const result = {
-    id: first.id || `chatcmpl-${Date.now()}`,
-    object: "chat.completion",
-    created: first.created || Math.floor(Date.now() / 1000),
-    model: first.model || fallbackModel || "unknown",
-    choices: [{ index: 0, message, finish_reason: finishReason }]
-  };
-  if (usage) result.usage = usage;
-  return result;
 }
 
 /**
@@ -283,6 +217,10 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
         };
       }
 
+      if (sourceFormat === FORMATS.CLAUDE) {
+        finalResp = openAICompletionToClaudeMessage(finalResp);
+      }
+
       return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalResp, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
     } catch (err) {
       console.error("[ChatCore] Responses API SSE→JSON failed:", err);
@@ -361,7 +299,9 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     // already imports parseSSEToOpenAIResponse from this module.
     const finalBody = sourceFormat === FORMATS.OPENAI_RESPONSES
       ? chatCompletionToResponses(parsed, customToolNames)
-      : parsed;
+      : sourceFormat === FORMATS.CLAUDE
+        ? openAICompletionToClaudeMessage(parsed)
+        : parsed;
 
     return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
   } catch (err) {

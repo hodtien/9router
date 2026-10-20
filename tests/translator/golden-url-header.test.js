@@ -24,6 +24,7 @@ const SPECIALIZED = new Set([
 ]);
 
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
+// X-Msh-Device-Name là hostname máy chạy test — không commit hostname thật vào repo.
 function sanitize(headers) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
@@ -32,6 +33,9 @@ function sanitize(headers) {
           .replace(/sk-test-APIKEY|tok-test-ACCESS/g, "<CRED>")
           .replace(/kimi-\d{10,}/g, "kimi-<TS>")
       : v;
+    if (k === "X-Msh-Device-Name" && typeof out[k] === "string") out[k] = "<HOSTNAME>";
+    // MiniMax tạo session id ngẫu nhiên mỗi lần build -> không ổn định.
+    if (k === "X-Mavis-Session-Id" && typeof out[k] === "string") out[k] = "<SESSION>";
   }
   return out;
 }

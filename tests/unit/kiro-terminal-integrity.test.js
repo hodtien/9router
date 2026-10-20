@@ -113,6 +113,10 @@ async function text(stream) {
 }
 
 async function execute(executor = new KiroExecutor(), overrides = {}) {
+  executor.config = {
+    ...executor.config,
+    baseUrls: [executor.config.baseUrls[0]],
+  };
   return executor.execute({
     model: "kr/claude-opus-4.8",
     body: { conversationState: { currentMessage: { userInputMessage: { content: "base", modelId: "m" } } } },

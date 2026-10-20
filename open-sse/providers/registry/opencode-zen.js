@@ -1,4 +1,4 @@
-export default {
+const opencodeZen = {
   id: "opencode-zen",
   priority: 205,
   alias: "ocz",
@@ -133,3 +133,5 @@ export default {
     usageApikey: true,
   },
 };
+
+export default opencodeZen;

@@ -31,6 +31,7 @@ import {
 } from "../../config/kiroConstants.js";
 import { DEFAULT_IMAGE_MIME } from "../schema/index.js";
 import { ROLE, CLAUDE_BLOCK } from "../schema/index.js";
+import { extractForwardableSystemText } from "../concerns/claudeCodeSystem.js";
 import {
   canonicalizeKiroConversation,
   normalizeKiroToolSpecs,
@@ -213,18 +214,6 @@ function convertClaudeMessagesToKiro(messages, model) {
   return { history: mergedHistory, currentMessage };
 }
 
-function extractClaudeSystemText(system) {
-  if (!system) return "";
-  if (typeof system === "string") return system;
-  if (Array.isArray(system)) {
-    return system.map((s) => {
-      if (typeof s === "string") return s;
-      return s?.text || "";
-    }).filter(Boolean).join("\n");
-  }
-  return "";
-}
-
 /**
  * Build a Kiro payload directly from a Claude Messages API request body.
  */
@@ -263,7 +252,7 @@ export function claudeToKiroRequest(model, body, stream, credentials) {
     systemPromptParts.push(buildThinkingSystemPrefix(thinkingBudget));
   }
   if (agentic) systemPromptParts.push(KIRO_AGENTIC_SYSTEM_PROMPT);
-  const systemInstruction = extractClaudeSystemText(body.system);
+  const systemInstruction = extractForwardableSystemText(body.system);
   if (systemInstruction) systemPromptParts.push(systemInstruction);
   const systemPrompt = systemPromptParts.filter(Boolean).join("\n\n");
   const currentTimeContext = `[Context: Current time is ${timestamp}]`;

@@ -13,6 +13,8 @@ export default function OpenCodeToolCard({ tool, isExpanded, onToggle, baseUrl, 
   const [checking, setChecking] = useState(false);
   const [applying, setApplying] = useState(false);
   const [restoring, setRestoring] = useState(false);
+  const [refreshingProfile, setRefreshingProfile] = useState(false);
+  const [profileStatus, setProfileStatus] = useState(null);
   const [message, setMessage] = useState(null);
   const [showInstallGuide, setShowInstallGuide] = useState(false);
   const [selectedApiKey, setSelectedApiKey] = useState("");
@@ -124,6 +126,30 @@ export default function OpenCodeToolCard({ tool, isExpanded, onToggle, baseUrl, 
       setStatus({ installed: false, error: error.message });
     } finally {
       setChecking(false);
+    }
+  };
+
+  const refreshProfile = async () => {
+    setRefreshingProfile(true);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/cli-tools/opencode-profile", { method: "POST" });
+      const data = await res.json();
+      setProfileStatus(data);
+      setMessage({
+        type: res.ok ? "success" : "error",
+        text: data.state === "direct-egress"
+          ? "OpenCode is using the direct IP; a new profile will not clear its 429 bucket."
+          : data.state === "cooldown"
+            ? "A profile refresh is already within its cooldown window."
+            : res.ok
+              ? `Profile probe: ${data.state} (HTTP handoff remains ${data.handoff}).`
+              : "OpenCode profile refresh failed.",
+      });
+    } catch (error) {
+      setMessage({ type: "error", text: error.message });
+    } finally {
+      setRefreshingProfile(false);
     }
   };
 
@@ -448,10 +474,18 @@ export default function OpenCodeToolCard({ tool, isExpanded, onToggle, baseUrl, 
                 <Button variant="outline" size="sm" onClick={handleReset} disabled={!status.has9Router} loading={restoring}>
                   <span className="material-symbols-outlined text-[14px] mr-1">restore</span>Reset
                 </Button>
+                <Button variant="outline" size="sm" onClick={refreshProfile} loading={refreshingProfile}>
+                  <span className="material-symbols-outlined text-[14px] mr-1">refresh</span>Refresh profile
+                </Button>
                 <Button variant="ghost" size="sm" onClick={() => setShowManualConfigModal(true)}>
                   <span className="material-symbols-outlined text-[14px] mr-1">content_copy</span>Manual Config
                 </Button>
               </div>
+              {profileStatus && (
+                <div className="text-xs text-text-muted">
+                  Profile: {profileStatus.state} · proxy: {profileStatus.proxy} · handoff: {profileStatus.handoff}
+                </div>
+              )}
             </>
           )}
         </div>

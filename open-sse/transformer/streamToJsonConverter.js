@@ -28,6 +28,7 @@ function processSSEMessage(msg, state) {
   } else if (eventType === "response.output_item.done") {
     state.items.set(parsed.output_index ?? 0, parsed.item);
   } else if (eventType === "response.completed" || eventType === "response.done") {
+    if (Array.isArray(parsed.response?.output)) state.terminalResponse = parsed.response;
     state.status = "completed";
     if (parsed.response?.usage) {
       state.usage.input_tokens = parsed.response.usage.input_tokens || 0;
@@ -84,6 +85,8 @@ export async function convertResponsesStreamToJson(stream) {
   } finally {
     reader.releaseLock();
   }
+
+  if (state.terminalResponse) return state.terminalResponse;
 
   // Build output array from accumulated items (ordered by index)
   const output = [];

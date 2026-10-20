@@ -74,14 +74,21 @@ describe("Qoder signed inference transport", () => {
     expect(ids[0]).not.toBe(ids[1]);
   });
 
-  it.each([true, false])("still supports successful inference with proxy=%s", async (useProxy) => {
+  it("succeeds through the configured proxy", async () => {
     const fetchMock = vi.fn(async () => success());
-    const executor = await loadExecutor(fetchMock, useProxy);
+    const executor = await loadExecutor(fetchMock);
     const result = await executor.execute(request);
     expect(result.response.ok).toBe(true);
     await result.response.text();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(!!fetchMock.mock.calls[0][1].dispatcher).toBe(useProxy);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][1].dispatcher).toBeDefined();
+  });
+
+  it("fails closed without a proxy and never sends the signed request directly", async () => {
+    const fetchMock = vi.fn(async () => success());
+    const executor = await loadExecutor(fetchMock, false);
+    await expect(executor.execute(request)).rejects.toThrow("Proxy required but no proxy URL was provided");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("preserves caller cancellation without replaying the request", async () => {

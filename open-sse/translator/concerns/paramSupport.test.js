@@ -9,6 +9,24 @@ import { stripUnsupportedParams, enforceParamMinimums } from "./paramSupport.js"
 
 // ---------- Sakana fugu / fugu-ultra ----------
 
+test("VolcEngine Ark GLM-5: clamps token limits to its model output ceiling", () => {
+  const body = { max_tokens: 200000, max_completion_tokens: 200000, max_output_tokens: 200000 };
+  stripUnsupportedParams("volcengine-ark", "GLM-5.2", body);
+  assert.deepEqual(body, { max_tokens: 128000, max_completion_tokens: 128000, max_output_tokens: 128000 });
+});
+
+test("VolcEngine Ark Kimi: clamps token limits to the endpoint cap", () => {
+  const body = { max_tokens: 131072, max_completion_tokens: 131072, max_output_tokens: 131072 };
+  stripUnsupportedParams("volcengine-ark", "Kimi-K2.7-Code", body);
+  assert.deepEqual(body, { max_tokens: 32768, max_completion_tokens: 32768, max_output_tokens: 32768 });
+});
+
+test("Xiaomi MiMo Preview: flattens OpenAI content parts", () => {
+  const body = { messages: [{ role: "user", content: [{ type: "text", text: "hi" }, { type: "image_url", image_url: { url: "data:image/png;base64,xx" } }] }] };
+  stripUnsupportedParams("xiaomi-mimo", "mimo-preview", body);
+  assert.equal(body.messages[0].content, "hi");
+});
+
 test("fugu-ultra: bumps max_tokens from 1 up to floor 16", () => {
   const body = { model: "fugu-ultra", max_tokens: 1, messages: [] };
   enforceParamMinimums("openai-compatible-chat-x", "fugu-ultra", body);

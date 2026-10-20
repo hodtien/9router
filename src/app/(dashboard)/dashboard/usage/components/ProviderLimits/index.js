@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import QuotaTable from "./QuotaTable";
 import Toggle from "@/shared/components/Toggle";
@@ -12,6 +13,9 @@ import {
   getHiddenQuotaRows,
   getQuotaVisibilityKey,
   getConnectionLabel,
+  maskAccountIdentity,
+  getAccountTypeLabel,
+  getPlanLabel,
   getConnectionQuotaRemaining,
   sortVisibleConnections,
   buildLoadingState,
@@ -32,6 +36,7 @@ import {
   CLAUDE_REFRESH_INTERVAL_MS,
   DEPLETED_QUOTA_THRESHOLD,
   AUTO_REFRESH_STORAGE_KEY,
+  HIDE_ACCOUNT_IDENTITY_STORAGE_KEY,
   CONNECTIONS_PAGE_SIZE,
   ACCOUNT_PAGE_SIZE_OPTIONS,
   ACCOUNT_PAGE_SIZE_MAX,
@@ -40,12 +45,11 @@ import {
 } from "./utils";
 import Card from "@/shared/components/Card";
 import { ConfirmModal, EditConnectionModal } from "@/shared/components";
+import AutoPingScheduleModal from "@/app/(dashboard)/dashboard/providers/[id]/AutoPingScheduleModal";
+import { getScheduleSlotLabels } from "@/shared/services/quotaPingSchedule";
 import { USAGE_SUPPORTED_PROVIDERS, AI_PROVIDERS } from "@/shared/constants/providers";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 
-// Maps the stored providerSpecificData.authMethod to a human label for Kiro.
-// Values come from the Kiro connect flows: builder-id/idc (device code),
-// google/github (social), imported (refresh-token paste), api_key (headless).
 const KIRO_METHOD_LABELS = {
   "builder-id": "AWS Builder ID",
   idc: "IAM Identity Center",
@@ -55,6 +59,12 @@ const KIRO_METHOD_LABELS = {
   api_key: "API Key",
 };
 
+function kiroMethodLabel(conn) {
+  const method = conn.providerSpecificData?.authMethod;
+  if (method && KIRO_METHOD_LABELS[method]) return KIRO_METHOD_LABELS[method];
+  return conn.authType === "api_key" ? "API Key" : "OAuth";
+}
+
 const AUTO_PING_SETTINGS_KEYS = {
   claude: "claudeAutoPing",
   codex: "codexAutoPing",
@@ -62,25 +72,18 @@ const AUTO_PING_SETTINGS_KEYS = {
 
 const AUTO_PING_TOOLTIPS = {
   claude: "When your 5h quota runs out, auto-sends a request the moment it resets so a new window starts right away.",
-  codex: "Auto-starts the next 5h Codex window after reset by sending a tiny gpt-5.5 request. Consumes a small amount of quota.",
+  codex: "Auto-starts the next 5h Codex window after reset by sending a tiny request. Consumes a small amount of quota.",
 };
 
-function kiroMethodLabel(conn) {
-  const m = conn.providerSpecificData?.authMethod;
-  if (m && KIRO_METHOD_LABELS[m]) return KIRO_METHOD_LABELS[m];
-  return conn.authType === "api_key" ? "API Key" : "OAuth";
-}
-
-function getConnectionSecondaryLabel(connection) {
+function getConnectionSecondaryLabel(connection, options = {}) {
+  let label = null;
   if (connection.name?.trim() && connection.email?.trim() && connection.name.trim() !== connection.email.trim()) {
-    return connection.email.trim();
+    label = connection.email.trim();
+  } else if (connection.name?.trim() && connection.displayName?.trim() && connection.name.trim() !== connection.displayName.trim()) {
+    label = connection.displayName.trim();
   }
 
-  if (connection.name?.trim() && connection.displayName?.trim() && connection.name.trim() !== connection.displayName.trim()) {
-    return connection.displayName.trim();
-  }
-
-  return null;
+  return options.hideIdentity ? maskAccountIdentity(label) : label;
 }
 
 // Region is stored for builder-id/idc/api_key flows; social and imported flows
@@ -98,6 +101,28 @@ function getCodexResetCreditCount(quota) {
   const value = quota?.raw?.resetCredits?.availableCount;
   const count = typeof value === "number" ? value : Number(value);
   return Number.isFinite(count) ? Math.max(0, count) : 0;
+}
+
+const CLAUDE_RESET_LIMIT_NAMES = {
+  five_hour: "session",
+  seven_day: "weekly",
+  seven_day_overage_included: "weekly",
+  seven_day_opus: "Opus weekly",
+  seven_day_sonnet: "Sonnet weekly",
+};
+
+function formatClaudeResetClears(clears) {
+  const names = [...new Set((clears || []).map((c) => CLAUDE_RESET_LIMIT_NAMES[c]).filter(Boolean))];
+  return names.length ? `${names.join(" + ")} limits` : "limits";
+}
+
+function claudeGrantStatus(grant) {
+  if (grant.resetsLeft <= 0) return "used";
+  if (grant.paused) return "paused";
+  if (grant.endsAt && new Date(grant.endsAt).getTime() <= Date.now()) return "expired";
+  if (grant.usableNow) return "usable now";
+  if (grant.startsAt && new Date(grant.startsAt).getTime() > Date.now()) return "not started";
+  return grant.useRequiresLimit ? "at limit only" : "unavailable";
 }
 
 function providerLabel(providerId) {
@@ -130,14 +155,20 @@ function formatTimeRemaining(value) {
 
 export default function ProviderLimits() {
   const { copied, copy } = useCopyToClipboard();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
   const [connections, setConnections] = useState([]);
   const [quotaData, setQuotaData] = useState({});
   const [loading, setLoading] = useState({});
   const [errors, setErrors] = useState({});
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [autoPingMaps, setAutoPingMaps] = useState({ claude: {}, codex: {} });
+  const [hideAccountIdentity, setHideAccountIdentity] = useState(false);
+  const [autoPingConfigs, setAutoPingConfigs] = useState({ claude: {}, codex: {} });
+  const [scheduleConnection, setScheduleConnection] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [hasHydratedAutoRefresh, setHasHydratedAutoRefresh] = useState(false);
+  const [hasHydratedHideIdentity, setHasHydratedHideIdentity] = useState(false);
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [countdown, setCountdown] = useState(60);
   const [connectionsLoading, setConnectionsLoading] = useState(true);
@@ -149,7 +180,26 @@ export default function ProviderLimits() {
   const [showEditModal, setShowEditModal] = useState(false);
   const [selectedConnection, setSelectedConnection] = useState(null);
   const [proxyPools, setProxyPools] = useState([]);
-  const [providerFilter, setProviderFilter] = useState("all");
+  // Initialize providerFilter from URL ?provider= param so the page
+  // can be bookmarked / deep-linked to a specific provider (#4217).
+  const [providerFilter, _setProviderFilter] = useState(
+    () => searchParams?.get("provider") || "all"
+  );
+  // Wrapper: keeps URL in sync with the selected provider so the view can be
+  // bookmarked. Replaces the URL without adding to browser history.
+  const setProviderFilter = useCallback((value) => {
+    _setProviderFilter(value);
+    try {
+      const params = new URLSearchParams(searchParams?.toString() || "");
+      if (value === "all") {
+        params.delete("provider");
+      } else {
+        params.set("provider", value);
+      }
+      const newUrl = params.toString() ? `${pathname}?${params.toString()}` : pathname;
+      router.replace(newUrl, { scroll: false });
+    } catch { /* non-fatal: URL sync is best-effort */ }
+  }, [pathname, router, searchParams]);
   const [providerOptions, setProviderOptions] = useState([]);
   const [accountFilter, setAccountFilter] = useState("all");
   const [quotaSortMode, setQuotaSortMode] = useState("default");
@@ -193,6 +243,7 @@ export default function ProviderLimits() {
 
         const response = await fetch(
           `/api/providers/client?${params.toString()}`,
+          { credentials: "include" },
         );
         if (!response.ok) throw new Error("Failed to fetch connections");
 
@@ -229,7 +280,7 @@ export default function ProviderLimits() {
         `[ProviderLimits] Fetching quota for ${provider} (${connectionId})`,
       );
       const url = `/api/usage/${connectionId}${force ? "?force=1" : ""}`;
-      const response = await fetch(url);
+      const response = await fetch(url, { credentials: "include" });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -308,34 +359,46 @@ export default function ProviderLimits() {
 
   const handleResetCodexLimit = useCallback(
     async (connectionId, provider) => {
-      if (provider !== "codex" || resettingLimitId) return;
+      if ((provider !== "codex" && provider !== "claude") || resettingLimitId) return;
 
       setResettingLimitId(connectionId);
       setErrors((prev) => ({ ...prev, [connectionId]: null }));
 
       try {
-        const response = await fetch(`/api/usage/${connectionId}/codex-reset-credits`, { method: "POST" });
+        const response = provider === "claude"
+          ? await fetch(`/api/usage/${connectionId}/claude-reset`, {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ grantId: quotaData[connectionId]?.raw?.resetCredits?.nextGrantId }),
+          })
+          : await fetch(`/api/usage/${connectionId}/codex-reset-credits`, { method: "POST", credentials: "include" });
         const result = await response.json().catch(() => ({}));
 
         if (!response.ok) {
-          throw new Error(result.message || result.error || result.code || "Failed to reset Codex limit");
+          throw new Error(result.message || result.error || result.code || "Failed to reset limit");
         }
 
-        await fetchQuota(connectionId, provider);
+        await fetchQuota(connectionId, provider, { force: true });
         setLastUpdated(new Date());
       } catch (error) {
-        setErrors((prev) => ({ ...prev, [connectionId]: error.message || "Failed to reset Codex limit" }));
+        setErrors((prev) => ({ ...prev, [connectionId]: error.message || "Failed to reset limit" }));
       } finally {
         setResettingLimitId(null);
       }
     },
-    [fetchQuota, resettingLimitId],
+    [fetchQuota, resettingLimitId, quotaData],
   );
+
+  // Claude grants already arrive with the usage read; no extra fetch
+  const handleViewClaudeResets = useCallback((connection, resetCredits) => {
+    setResetCreditsState({ connection, loading: false, error: null, data: { kind: "claude", ...resetCredits } });
+  }, []);
 
   const handleViewCodexResetCredits = useCallback(async (connection) => {
     setResetCreditsState({ connection, loading: true, error: null, data: null });
     try {
-      const response = await fetch(`/api/usage/${connection.id}/codex-reset-credits`, { cache: "no-store" });
+      const response = await fetch(`/api/usage/${connection.id}/codex-reset-credits`, { cache: "no-store", credentials: "include" });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(result.error || result.message || "Failed to load Codex reset credits");
@@ -357,7 +420,7 @@ export default function ProviderLimits() {
       if (!confirm("Delete this connection?")) return;
       setDeletingId(id);
       try {
-        const res = await fetch(`/api/providers/${id}`, { method: "DELETE" });
+        const res = await fetch(`/api/providers/${id}`, { method: "DELETE", credentials: "include" });
         if (res.ok) {
           setQuotaData((prev) => {
             const next = { ...prev };
@@ -406,6 +469,7 @@ export default function ProviderLimits() {
       setTogglingId(id);
       try {
         const res = await fetch(`/api/providers/${id}`, {
+          credentials: "include",
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ isActive }),
@@ -433,6 +497,7 @@ export default function ProviderLimits() {
       const provider = selectedConnection.provider;
       try {
         const res = await fetch(`/api/providers/${connectionId}`, {
+          credentials: "include",
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(formData),
@@ -454,7 +519,7 @@ export default function ProviderLimits() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/proxy-pools?isActive=true", { cache: "no-store" })
+    fetch("/api/proxy-pools?isActive=true", { cache: "no-store", credentials: "include" })
       .then((res) => res.json())
       .then((data) => {
         if (!cancelled && data?.proxyPools) {
@@ -541,46 +606,74 @@ export default function ProviderLimits() {
     window.localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, String(autoRefresh));
   }, [autoRefresh, hasHydratedAutoRefresh]);
 
-  // Load auto-ping per-connection maps
   useEffect(() => {
-    fetch("/api/settings", { cache: "no-store" })
+    if (typeof window === "undefined") return;
+    setHideAccountIdentity(
+      window.localStorage.getItem(HIDE_ACCOUNT_IDENTITY_STORAGE_KEY) === "true",
+    );
+    setHasHydratedHideIdentity(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !hasHydratedHideIdentity) return;
+    window.localStorage.setItem(
+      HIDE_ACCOUNT_IDENTITY_STORAGE_KEY,
+      String(hideAccountIdentity),
+    );
+  }, [hideAccountIdentity, hasHydratedHideIdentity]);
+
+  // Load auto-ping per-connection configs
+  useEffect(() => {
+    fetch("/api/settings", { cache: "no-store", credentials: "include" })
       .then((r) => (r.ok ? r.json() : {}))
       .then((s) => {
-        setAutoPingMaps({
-          claude: s?.claudeAutoPing?.connections || {},
-          codex: s?.codexAutoPing?.connections || {},
+        setAutoPingConfigs({
+          claude: s?.claudeAutoPing || {},
+          codex: s?.codexAutoPing || {},
         });
         setQuotaVisibility(s?.quotaVisibility || {});
       })
       .catch(() => {});
   }, []);
 
-  const toggleAutoPing = useCallback(async (connectionId, provider, on) => {
+  const handleSaveAutoPing = useCallback(async (connectionId, provider, { reactive, schedule }) => {
     const settingsKey = AUTO_PING_SETTINGS_KEYS[provider];
     if (!settingsKey) return;
 
-    const previous = autoPingMaps;
-    const nextProviderMap = { ...(autoPingMaps[provider] || {}), [connectionId]: on };
-    const nextMaps = { ...autoPingMaps, [provider]: nextProviderMap };
-    setAutoPingMaps(nextMaps);
+    const previous = autoPingConfigs;
+    const prevCfg = autoPingConfigs[provider] || {};
+    const nextProviderCfg = {
+      ...prevCfg,
+      connections: { ...(prevCfg.connections || {}), [connectionId]: reactive },
+      schedules: { ...(prevCfg.schedules || {}), [connectionId]: schedule },
+    };
+    const nextConfigs = { ...autoPingConfigs, [provider]: nextProviderCfg };
+    setAutoPingConfigs(nextConfigs);
+
     try {
-      const r = await fetch("/api/settings", { cache: "no-store" });
+      const r = await fetch("/api/settings", { cache: "no-store", credentials: "include" });
       const s = r.ok ? await r.json() : {};
-      const cfg = { ...(s[settingsKey] || {}), connections: nextProviderMap };
+      const fullCfg = {
+        ...(s[settingsKey] || {}),
+        connections: nextProviderCfg.connections,
+        schedules: nextProviderCfg.schedules,
+      };
       await fetch("/api/settings", {
+        credentials: "include",
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ [settingsKey]: cfg }),
+        body: JSON.stringify({ [settingsKey]: fullCfg }),
       });
     } catch {
-      setAutoPingMaps(previous);
+      setAutoPingConfigs(previous);
     }
-  }, [autoPingMaps]);
+  }, [autoPingConfigs]);
 
   const updateQuotaVisibility = useCallback(async (nextVisibility, previousVisibility) => {
     setQuotaVisibility(nextVisibility);
     try {
       const response = await fetch("/api/settings", {
+        credentials: "include",
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ quotaVisibility: nextVisibility }),
@@ -740,6 +833,7 @@ export default function ProviderLimits() {
         await Promise.all(
           targetIds.map((id) =>
             fetch(`/api/providers/${id}`, {
+              credentials: "include",
               method: "PUT",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ isActive }),
@@ -1020,6 +1114,22 @@ export default function ProviderLimits() {
             )}
           </button>
 
+          {/* Account identity privacy toggle */}
+          <button
+            type="button"
+            onClick={() => setHideAccountIdentity((prev) => !prev)}
+            aria-pressed={hideAccountIdentity}
+            aria-label={hideAccountIdentity ? "Show account names and emails" : "Hide account names and emails"}
+            className={`flex h-8 shrink-0 items-center gap-1 rounded-lg border px-2 text-xs transition-colors ${hideAccountIdentity ? "border-primary/40 bg-primary/10 text-primary" : "border-black/10 text-text-primary hover:bg-black/5 dark:border-white/10 dark:hover:bg-white/5"}`}
+            title={hideAccountIdentity ? "Show account names and emails" : "Hide account names and emails"}
+          >
+            <span aria-hidden="true" className="material-symbols-outlined text-[14px]">
+              {hideAccountIdentity ? "visibility_off" : "visibility"}
+            </span>
+            <span className="hidden sm:inline">
+              {hideAccountIdentity ? "Show names" : "Hide names"}
+            </span>
+          </button>
 
           {/* Refresh all button */}
           <button
@@ -1055,6 +1165,11 @@ export default function ProviderLimits() {
           // Use table layout for all providers
           const isInactive = conn.isActive === false;
           const isCodex = conn.provider === "codex";
+          const planLabel = getPlanLabel(
+            quota?.plan || conn.providerSpecificData?.chatgptPlanType || conn.providerSpecificData?.plan,
+          );
+          const claudeReset = conn.provider === "claude" ? quota?.raw?.resetCredits : null;
+          const resetLabel = isCodex ? "Codex reset credit" : "Claude limit reset";
           const resetCreditCount = getCodexResetCreditCount(quota);
           const isResettingLimit = resettingLimitId === conn.id;
           const rowBusy = deletingId === conn.id || togglingId === conn.id || isResettingLimit;
@@ -1083,42 +1198,41 @@ export default function ProviderLimits() {
                       />
                     </div>
                     <div className="min-w-0">
-                      <h3 className="text-sm font-semibold text-text-primary truncate">
-                        {providerLabel(conn.provider)}
-                      </h3>
-                      {getConnectionLabel(conn) ? (
-                        <p className="text-xs text-text-muted truncate">
-                          {getConnectionLabel(conn)}
-                        </p>
-                      ) : null}
-                      {getConnectionSecondaryLabel(conn) ? (
-                        <p className="text-[11px] text-text-muted/80 truncate">
-                          {getConnectionSecondaryLabel(conn)}
-                        </p>
-                      ) : null}
-                      {conn.provider === "kiro" && (
-                        <div className="mt-1 flex flex-wrap items-center gap-1">
+                      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                        <h3 className="text-xs font-semibold text-text-primary capitalize truncate">
+                          {providerLabel(conn.provider)}
+                        </h3>
+                        <span className="rounded-full bg-brand-500/10 px-2 py-0.5 text-[10px] font-semibold text-brand-600 dark:text-brand-300">
+                          {getAccountTypeLabel(conn)}
+                        </span>
+                        {planLabel && (
+                          <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                            {planLabel}
+                          </span>
+                        )}
+                        {conn.provider === "kiro" && (
                           <span className="rounded-full bg-brand-500/10 px-2 py-0.5 text-[10px] font-semibold text-brand-600 dark:text-brand-300">
                             {kiroMethodLabel(conn)}
                           </span>
+                        )}
+                      </div>
+                      {getConnectionLabel(conn, { hideIdentity: hideAccountIdentity }) ? (
+                        <p className="text-xs text-text-muted truncate">
+                          {getConnectionLabel(conn, { hideIdentity: hideAccountIdentity })}
+                        </p>
+                      ) : null}
+                      {getConnectionSecondaryLabel(conn, { hideIdentity: hideAccountIdentity }) ? (
+                        <p className="text-[11px] text-text-muted/80 truncate">
+                          {getConnectionSecondaryLabel(conn, { hideIdentity: hideAccountIdentity })}
+                        </p>
+                      ) : null}
+                      {(conn.provider === "kiro" && (kiroRegion(conn) || conn.providerSpecificData?.profileArn)) && (
+                        <div className="mt-1 flex flex-wrap items-center gap-1">
                           {kiroRegion(conn) && (
                             <span className="rounded-full bg-blue-500/10 px-2 py-0.5 text-[10px] font-semibold text-blue-600 dark:text-blue-400">
                               {kiroRegion(conn)}
                             </span>
                           )}
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                              isInactive
-                                ? "bg-surface-2 text-text-muted"
-                                : conn.testStatus === "active" || conn.testStatus === "success"
-                                  ? "bg-green-500/10 text-green-600 dark:text-green-400"
-                                  : conn.testStatus === "error" || conn.testStatus === "expired" || conn.testStatus === "unavailable"
-                                    ? "bg-red-500/10 text-red-600 dark:text-red-400"
-                                    : "bg-surface-2 text-text-muted"
-                            }`}
-                          >
-                            {isInactive ? "disabled" : conn.testStatus || "unknown"}
-                          </span>
                           {conn.providerSpecificData?.profileArn && (
                             <button
                               type="button"
@@ -1140,13 +1254,15 @@ export default function ProviderLimits() {
                   </div>
 
                   <div className="flex items-center gap-1 shrink-0">
-                    {isCodex && (
+                    {(isCodex || claudeReset) && (
                       <>
                         <Tooltip
                           text={
                             resetCreditCount > 0
-                              ? `Use one Codex reset credit. Available: ${resetCreditCount}`
-                              : "No Codex reset credits available"
+                              ? claudeReset
+                                ? `Use your reset now (${resetCreditCount} left, use by ${formatCreditDate(claudeReset.expiresAt)}) · refills ${formatClaudeResetClears(claudeReset.clears)}`
+                                : `Use one ${resetLabel}. Available: ${resetCreditCount}`
+                              : `No ${resetLabel}s available`
                           }
                         >
                           <button
@@ -1155,8 +1271,8 @@ export default function ProviderLimits() {
                             disabled={resetCreditCount <= 0 || isLoading || rowBusy}
                             aria-label={
                               resetCreditCount > 0
-                                ? `Use one Codex reset credit. ${resetCreditCount} available.`
-                                : "No Codex reset credits available"
+                                ? `Use one ${resetLabel}. ${resetCreditCount} available.`
+                                : `No ${resetLabel}s available`
                             }
                             className={`flex h-8 min-w-10 items-center justify-center gap-1 rounded-lg border px-2 text-[11px] font-medium tabular-nums transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary/60 disabled:cursor-not-allowed disabled:opacity-60 ${
                               resetCreditCount > 0
@@ -1170,12 +1286,12 @@ export default function ProviderLimits() {
                             <span>{resetCreditCount}</span>
                           </button>
                         </Tooltip>
-                        <Tooltip text="View Codex reset credit expiry">
+                        <Tooltip text={isCodex ? "View Codex reset credit expiry" : "View Claude Code reset expiry"}>
                           <button
                             type="button"
-                            onClick={() => handleViewCodexResetCredits(conn)}
+                            onClick={() => (isCodex ? handleViewCodexResetCredits(conn) : handleViewClaudeResets(conn, claudeReset))}
                             disabled={isLoading || rowBusy}
-                            aria-label="View Codex reset credit expiry"
+                            aria-label={isCodex ? "View Codex reset credit expiry" : "View Claude Code reset expiry"}
                             className="flex h-8 w-8 items-center justify-center rounded-lg border border-black/10 text-text-muted transition-colors hover:bg-black/5 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:hover:bg-white/5"
                           >
                             <span className="material-symbols-outlined text-[17px]">schedule</span>
@@ -1183,18 +1299,38 @@ export default function ProviderLimits() {
                         </Tooltip>
                       </>
                     )}
-                    {AUTO_PING_SETTINGS_KEYS[conn.provider] && conn.authType === "oauth" && (
-                      <Tooltip text={AUTO_PING_TOOLTIPS[conn.provider]}>
-                        <button
-                          type="button"
-                          onClick={() => toggleAutoPing(conn.id, conn.provider, !(autoPingMaps[conn.provider]?.[conn.id] === true))}
-                          aria-label="Toggle auto-ping"
-                          className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5 ${autoPingMaps[conn.provider]?.[conn.id] === true ? "text-primary" : "text-text-muted"}`}
-                        >
-                          <span className="material-symbols-outlined text-[18px]">bolt</span>
-                        </button>
-                      </Tooltip>
-                    )}
+                    {AUTO_PING_SETTINGS_KEYS[conn.provider] && conn.authType === "oauth" && (() => {
+                      const cfg = autoPingConfigs[conn.provider] || {};
+                      const isReactive = cfg.connections?.[conn.id] === true;
+                      const schedule = cfg.schedules?.[conn.id];
+                      const isSchedule = schedule?.enabled === true;
+                      const isActive = isReactive || isSchedule;
+
+                      const activeModes = [];
+                      if (isReactive) activeModes.push("On reset");
+                      if (isSchedule) {
+                        const summary = getScheduleSlotLabels(schedule).join(" / ");
+                        activeModes.push(`Scheduled (${summary || "active"})`);
+                      }
+                      const tooltipText = activeModes.length > 0
+                        ? `Auto-ping active: ${activeModes.join(" + ")}. Click to configure.`
+                        : conn.provider === "codex"
+                          ? "Auto-starts the next 5h Codex window after reset or on schedule. Click to configure."
+                          : "Auto-starts a new window on quota reset or fixed schedule. Click to configure.";
+
+                      return (
+                        <Tooltip text={tooltipText}>
+                          <button
+                            type="button"
+                            onClick={() => setScheduleConnection(conn)}
+                            aria-label="Configure auto-ping"
+                            className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-black/5 dark:hover:bg-white/5 ${isActive ? "text-primary" : "text-text-muted"}`}
+                          >
+                            <span className="material-symbols-outlined text-[18px]">bolt</span>
+                          </button>
+                        </Tooltip>
+                      );
+                    })()}
                     <Tooltip text="Refresh quota">
                       <button
                         type="button"
@@ -1457,8 +1593,10 @@ export default function ProviderLimits() {
           await handleResetCodexLimit(connection.id, connection.provider);
           setResetConfirmState(null);
         }}
-        title="Reset Codex limit?"
-        message={`Use 1 Codex reset credit for ${getConnectionLabel(resetConfirmState?.connection || {}) || "this account"}. This cannot be undone. Remaining credits: ${resetConfirmState?.resetCreditCount ?? 0}.`}
+        title={resetConfirmState?.connection?.provider === "claude" ? "Reset Claude limits?" : "Reset Codex limit?"}
+        message={resetConfirmState?.connection?.provider === "claude"
+          ? `Refills your ${formatClaudeResetClears(quotaData[resetConfirmState.connection.id]?.raw?.resetCredits?.clears)} now for ${getConnectionLabel(resetConfirmState.connection, { hideIdentity: hideAccountIdentity }) || "this account"} · your weekly reset day stays ${formatCreditDate(quotaData[resetConfirmState.connection.id]?.raw?.resetCredits?.weeklyResetsAt)}. This cannot be undone. Resets left: ${resetConfirmState.resetCreditCount ?? 0}.`
+          : `Use 1 Codex reset credit for ${getConnectionLabel(resetConfirmState?.connection || {}, { hideIdentity: hideAccountIdentity }) || "this account"}. This cannot be undone. Remaining credits: ${resetConfirmState?.resetCreditCount ?? 0}.`}
         confirmText="Reset limit"
         cancelText="Cancel"
         variant="danger"
@@ -1470,9 +1608,11 @@ export default function ProviderLimits() {
           <div className="w-full max-w-2xl overflow-hidden rounded-2xl border border-black/15 bg-white shadow-2xl ring-1 ring-black/10 dark:border-white/15 dark:bg-neutral-950 dark:ring-white/10">
             <div className="flex items-start justify-between gap-3 border-b border-black/10 bg-black/[0.03] px-4 py-3 dark:border-white/10 dark:bg-white/[0.04]">
               <div className="min-w-0">
-                <h3 className="text-base font-semibold text-text-primary">Codex Reset Credit Expiry</h3>
+                <h3 className="text-base font-semibold text-text-primary">
+                  {resetCreditsState.data?.kind === "claude" ? "Claude Code Limit Resets" : "Codex Reset Credit Expiry"}
+                </h3>
                 <p className="mt-0.5 truncate text-xs text-text-muted">
-                  {getConnectionLabel(resetCreditsState.connection) || "Codex account"}
+                  {getConnectionLabel(resetCreditsState.connection, { hideIdentity: hideAccountIdentity }) || (resetCreditsState.data?.kind === "claude" ? "Claude account" : "Codex account")}
                 </p>
               </div>
               <button
@@ -1494,6 +1634,42 @@ export default function ProviderLimits() {
               ) : resetCreditsState.error ? (
                 <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-300">
                   {resetCreditsState.error}
+                </div>
+              ) : resetCreditsState.data?.kind === "claude" && resetCreditsState.data.grants?.length ? (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between rounded-xl border border-black/10 bg-black/[0.02] px-3 py-2 text-xs text-text-muted dark:border-white/10 dark:bg-white/[0.03]">
+                    <span>{resetCreditsState.data.availableCount ?? 0} reset{resetCreditsState.data.availableCount === 1 ? "" : "s"} left</span>
+                    <span>Weekly reset day: {formatCreditDate(resetCreditsState.data.weeklyResetsAt)}</span>
+                  </div>
+                  <div className="overflow-x-auto rounded-xl border border-black/10 dark:border-white/10">
+                    <table className="w-full min-w-[560px] text-left text-sm">
+                      <thead className="bg-black/[0.03] text-xs uppercase tracking-wide text-text-muted dark:bg-white/[0.04]">
+                        <tr>
+                          <th className="px-3 py-2 font-medium">Reset</th>
+                          <th className="px-3 py-2 font-medium">Left</th>
+                          <th className="px-3 py-2 font-medium">Refills</th>
+                          <th className="px-3 py-2 font-medium">Use By</th>
+                          <th className="px-3 py-2 font-medium">Remaining</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(resetCreditsState.data.grants || []).map((grant) => (
+                          <tr key={grant.id} className="border-t border-black/5 dark:border-white/5">
+                            <td className="px-3 py-2">
+                              <div className="text-text-primary">{grant.label || grant.id}</div>
+                              <span className="mt-1 inline-block rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                                {claudeGrantStatus(grant)}
+                              </span>
+                            </td>
+                            <td className="whitespace-nowrap px-3 py-2 font-medium tabular-nums text-text-primary">{grant.resetsLeft} / {grant.resetsTotal}</td>
+                            <td className="px-3 py-2 text-text-muted">{formatClaudeResetClears(grant.clears)}</td>
+                            <td className="px-3 py-2 text-text-primary">{formatCreditDate(grant.endsAt)}</td>
+                            <td className="whitespace-nowrap px-3 py-2 font-medium text-text-primary">{formatTimeRemaining(grant.endsAt)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               ) : resetCreditsState.data?.credits?.length ? (
                 <div className="space-y-3">
@@ -1530,7 +1706,7 @@ export default function ProviderLimits() {
                 </div>
               ) : (
                 <div className="rounded-xl border border-black/10 bg-black/[0.02] px-3 py-8 text-center text-sm text-text-muted dark:border-white/10 dark:bg-white/[0.03]">
-                  No reset credit details returned for this account.
+                  {resetCreditsState.data?.kind === "claude" ? "No limit resets available for this account." : "No reset credit details returned for this account."}
                 </div>
               )}
             </div>
@@ -1548,6 +1724,17 @@ export default function ProviderLimits() {
           setSelectedConnection(null);
         }}
       />
+
+      {scheduleConnection && (
+        <AutoPingScheduleModal
+          isOpen={!!scheduleConnection}
+          onClose={() => setScheduleConnection(null)}
+          connection={scheduleConnection}
+          reactive={autoPingConfigs[scheduleConnection.provider]?.connections?.[scheduleConnection.id] === true}
+          schedule={autoPingConfigs[scheduleConnection.provider]?.schedules?.[scheduleConnection.id] || null}
+          onSave={(result) => handleSaveAutoPing(scheduleConnection.id, scheduleConnection.provider, result)}
+        />
+      )}
     </div>
   );
 }

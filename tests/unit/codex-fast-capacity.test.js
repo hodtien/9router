@@ -14,8 +14,8 @@ function streamFromText(text) {
 describe("Codex fast tier and capacity handling", () => {
   it("maps Codex fast tier to priority and max reasoning to xhigh", () => {
     const executor = new CodexExecutor();
-    const body = executor.transformRequest("gpt-5.5", {
-      model: "gpt-5.5",
+    const body = executor.transformRequest("gpt-reserve", {
+      model: "gpt-reserve",
       input: "hi",
       reasoning_effort: "max",
       service_tier: "fast",
@@ -52,6 +52,22 @@ describe("Codex fast tier and capacity handling", () => {
     expect(peek.message).toBe("Selected model is at capacity. Please try a different model.");
   });
 
+  it.each([
+    ["429 usage_limit_reached", 'event: error\ndata: {"error":{"type":"usage_limit_reached","message":"You have hit your usage limit."}}\n\n'],
+    ["429 rate_limit", 'event: error\ndata: {"error":{"code":"rate_limit_exceeded","message":"rate_limit exceeded"}}\n\n'],
+    ["404 model_not_found", 'event: error\ndata: {"error":{"type":"model_not_found","message":"model_not_found"}}\n\n'],
+    ["404 ChatGPT model unsupported", 'event: error\ndata: {"error":{"message":"gpt-5.6-sol is not supported when using Codex with a ChatGPT account"}}\n\n'],
+  ])("classifies 200-SSE %s as account fallback", async (_label, sse) => {
+    const executor = new CodexExecutor();
+    const response = new Response(streamFromText(sse), {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+
+    const peek = await executor._peekSseTransientError(response);
+    expect(peek.accountFallback, "SSE error must trigger account fallback, not be streamed to the client").toBe(true);
+  });
+
   it("reassembles normal SSE after peeking", async () => {
     const executor = new CodexExecutor();
     const text = [
@@ -72,12 +88,12 @@ describe("Codex fast tier and capacity handling", () => {
 
 describe("Codex reasoning normalization", () => {
   it.each([
-    ["gpt-5.6-sol", "max", "max"],
+    ["gpt-5.6-sol", "max", "xhigh"],
     ["gpt-5.6-sol", "ultra", "ultra"],
-    ["gpt-5.6-terra", "max", "max"],
+    ["gpt-5.6-terra", "max", "xhigh"],
     ["gpt-5.6-terra", "ultra", "ultra"],
-    ["gpt-5.6-luna", "max", "max"],
-    ["gpt-5.6-luna", "ultra", "max"],
+    ["gpt-5.6-luna", "max", "xhigh"],
+    ["gpt-5.6-luna", "ultra", "xhigh"],
   ])("normalizes %s effort %s to %s", (model, effort, expected) => {
     const body = new CodexExecutor().transformRequest(model, {
       model,

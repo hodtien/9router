@@ -11,15 +11,22 @@ import { handleAntigravityQuotaError } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
+import { isOpencodeFreeTierRateLimitForProvider } from "open-sse/executors/opencodeGeoBlock.js";
+import { isGatedFreeTierRequest } from "open-sse/executors/opencodeFreeTierContract.js";
+import { refreshOpenCodeProfile } from "@/lib/opencodeProfile.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
+import { upstreamResponseHeaders } from "open-sse/utils/upstreamHeaders.js";
 import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
-import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import { HTTP_STATUS, ALL_ACCOUNTS_COOLDOWN_WAIT_MS } from "open-sse/config/runtimeConfig.js";
+import { planCooldownRetry } from "open-sse/services/accountFallback.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
+import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
+import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
 import { clientWantsStream, createKeepaliveSseResponse } from "open-sse/utils/earlySse.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
@@ -45,6 +52,18 @@ function headersWithoutInternalBypass(headers) {
   );
 }
 
+function profileProxyOptions(credentials) {
+  const data = credentials?.providerSpecificData || {};
+  return {
+    connectionProxyEnabled: data.connectionProxyEnabled === true,
+    connectionProxyUrl: data.connectionProxyUrl || "",
+    connectionNoProxy: data.connectionNoProxy || "",
+    connectionProxyPoolId: data.connectionProxyPoolId || null,
+    strictProxy: data.strictProxy === true,
+    vercelRelayUrl: data.vercelRelayUrl || "",
+  };
+}
+
 /**
  * Handle chat completion request
  * Supports: OpenAI, Claude, Gemini, OpenAI Responses API formats
@@ -68,7 +87,11 @@ export async function handleChat(request, clientRawRequest = null) {
       headers: headersWithoutInternalBypass(request.headers)
     };
   }
-  const modelStr = body.model;
+  // Claude Code marks a 1M-context request as `<model>[1m]`; the marker matches
+  // no combo, alias or provider/model pair, so it must not reach resolution.
+  // The capability travels in the anthropic-beta header, forwarded as-is.
+  const { model: modelStr, contextMarker } = stripModelContextMarker(body.model);
+  if (contextMarker) body.model = modelStr;
 
   // Request summary is emitted as the unified "▶" line in chatCore (has fmt/thinking/account)
 
@@ -101,6 +124,10 @@ export async function handleChat(request, clientRawRequest = null) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   }
 
+  const keyAccess = await getKeyAccessContext(request);
+  const keyAccessDenied = await enforceKeyAccess(keyAccess, modelStr);
+  if (keyAccessDenied) return keyAccessDenied;
+
   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
   const userAgent = request?.headers?.get("user-agent") || "";
   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
@@ -115,7 +142,7 @@ export async function handleChat(request, clientRawRequest = null) {
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
     const comboStrategy = comboSpecificStrategy || settings.comboStrategy || "fallback";
-    const augmentedModels = augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings);
+    const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, settings), comboModels);
     const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
     const runCombo = () => {
@@ -178,7 +205,7 @@ export async function handleChat(request, clientRawRequest = null) {
 
   // Single model request — may still switch to a capacity-adapter model if the
   // target lacks a capability the request needs (e.g. no vision, request has an image).
-  const soloAugmented = augmentModelsWithCapacityAdapter([modelStr], requiredCapabilities, settings);
+  const soloAugmented = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter([modelStr], requiredCapabilities, settings), [modelStr]);
   if (soloAugmented.length > 1) {
     const adapterAdded = soloAugmented.filter((m) => m !== modelStr);
     log.info("CHAT", `Capacity adapter for [${[...requiredCapabilities].join(",")}] on "${modelStr}" → trying ${soloAugmented.join(", ")}`);
@@ -195,8 +222,12 @@ export async function handleChat(request, clientRawRequest = null) {
     });
   }
 
-  // Single model request (client-facing → allow early SSE keepalive)
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, { earlySse: true });
+// Single model request (client-facing → allow early SSE keepalive)
+  return handleSingleModelChat(
+    body, modelStr, clientRawRequest, request, apiKey,
+    contextMarker ? `${modelStr.slice(modelStr.indexOf("/") + 1)}[${contextMarker}]` : null,
+    { earlySse: true },
+  );
 }
 
 /**
@@ -205,7 +236,7 @@ export async function handleChat(request, clientRawRequest = null) {
  *   call. Combo/fusion call this as a sub-handler and need real HTTP status/bodies
  *   so they can fallback — never nest keepalive SSE there.
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, opts = {}) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, opts = {}) {
   const earlySse = opts?.earlySse === true;
   const modelInfo = await getModelInfo(modelStr);
 
@@ -219,7 +250,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
       const comboStrategy = comboSpecificStrategy || chatSettings.comboStrategy || "fallback";
       const requiredCapabilities = detectRequiredCapabilities(body);
-      const augmentedModels = augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, chatSettings);
+      const keyAccess = await getKeyAccessContext(request);
+      const augmentedModels = await filterAdapterModels(keyAccess, augmentModelsWithCapacityAdapter(comboModels, requiredCapabilities, chatSettings), comboModels);
       const adapterAdded = augmentedModels.filter((m) => !comboModels.includes(m));
 
       if (comboStrategy === "fusion") {
@@ -274,7 +306,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   if (earlySse && clientWantsStream(body)) {
     return createKeepaliveSseResponse(async ({ writeError }) => {
       const outcome = await runAccountLoop({
-        provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist,
+        provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist, requestedModel,
       });
       if (outcome.kind === "response") return outcome.response;
       // Terminal error after SSE already opened → write as SSE error event
@@ -284,13 +316,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   }
 
   const outcome = await runAccountLoop({
-    provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist,
+    provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist, requestedModel,
   });
   if (outcome.kind === "response") return outcome.response;
   if (outcome.kind === "unavailable") {
-    return unavailableResponse(outcome.status, outcome.message, outcome.retryAfter, outcome.retryAfterHuman);
+    return unavailableResponse(outcome.status, outcome.message, outcome.retryAfter, outcome.retryAfterHuman, outcome.headers);
   }
-  return errorResponse(outcome.status, outcome.message);
+  return errorResponse(outcome.status, outcome.message, outcome.headers);
 }
 
 /**
@@ -298,17 +330,29 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
  * Returns { kind:"response", response } or { kind:"error"|"unavailable", ... }.
  * Does not throw for provider failures.
  */
-async function runAccountLoop({ provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist = false }) {
+async function runAccountLoop({ provider, model, body, clientRawRequest, request, apiKey, userAgent, bypassModelWhitelist = false, requestedModel = null }) {
   const excludeConnectionIds = new Set();
   let lastError = null;
   let lastStatus = null;
+  let lastHeaders = null;
+  const cooldownDeadline = Date.now() + ALL_ACCOUNTS_COOLDOWN_WAIT_MS;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { bypassModelWhitelist });
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { bypassModelWhitelist, requestedModel: requestedModel || model });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
+        // Every account is inside its cooldown. Wait out the earliest unlock when it
+        // is close enough, so one-shot callers (subagents) retry instead of dying on
+        // a 429 that would clear on its own moments later.
+        const waitMs = planCooldownRetry(credentials.retryAfter, cooldownDeadline - Date.now());
+        if (waitMs > 0) {
+          log.warn("CHAT", `[${provider}/${model}] all accounts cooling down — waiting ${Math.ceil(waitMs / 1000)}s then retrying`);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = lastStatus || Number(credentials.lastErrorCode) || HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
@@ -318,6 +362,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
           message: `[${provider}/${model}] ${errorMsg}`,
           retryAfter: credentials.retryAfter,
           retryAfterHuman: credentials.retryAfterHuman,
+          headers: lastHeaders,
         };
       }
       if (excludeConnectionIds.size === 0) {
@@ -329,6 +374,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
         kind: "error",
         status: lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE,
         message: lastError || "All accounts unavailable",
+        headers: lastHeaders,
       };
     }
 
@@ -348,6 +394,7 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
     // Use shared chatCore
     const chatSettings = await getSettings();
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
+    let opencodeFreeTierRateLimited = false;
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },
@@ -373,7 +420,18 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
       // Lazily warms the in-process module on first use; null when not installed (fail-open)
       pxpipeTransform: chatSettings.pxpipeEnabled ? await getPxpipeTransform() : null,
       onPxpipeEvent: appendPxpipeEvent,
+      onProviderError: ({ provider: errorProvider, model: errorModel, status, bodyText }) => {
+        if (!isOpencodeFreeTierRateLimitForProvider(errorProvider, status, bodyText)
+          || !isGatedFreeTierRequest("zen", errorProvider, errorModel)) return;
+        opencodeFreeTierRateLimited = true;
+        refreshOpenCodeProfile({ proxyOptions: profileProxyOptions(refreshedCredentials) })
+          .then((profile) => log.info("OPENCODE_PROFILE", `${errorProvider}/${errorModel} | automatic refresh: ${profile.state}`))
+          .catch((error) => log.warn("OPENCODE_PROFILE", `automatic refresh failed: ${error.message}`));
+        log.warn("OPENCODE_PROFILE", `${errorProvider}/${errorModel} | 429 classified; returning upstream response without retry`);
+      },
       providerThinking,
+      // Per-provider user overrides (custom headers / connect timeout) from settings
+      providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
       // Detect source format by endpoint + body
       sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
       onCredentialsRefreshed: async (newCreds) => {
@@ -403,15 +461,18 @@ async function runAccountLoop({ provider, model, body, clientRawRequest, request
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
-    const shouldFallback = provider === "antigravity" && quotaResetMs
-      ? true
-      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
+    const shouldFallback = opencodeFreeTierRateLimited
+      ? false
+      : (provider === "antigravity" && quotaResetMs
+        ? true
+        : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback);
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
       excludeConnectionIds.add(credentials.connectionId);
       lastError = result.error;
       lastStatus = result.status;
+      lastHeaders = upstreamResponseHeaders(result.response?.headers);
       continue;
     }
 
