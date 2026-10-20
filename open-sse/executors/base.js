@@ -109,7 +109,7 @@ export class BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
-getTimeoutMs(credentials = null) {
+  getTimeoutMs(credentials = null) {
     // Priority: providerSpecificData.timeoutMs → config.timeoutMs → connect timeout default
     const specific = credentials?.providerSpecificData?.timeoutMs;
     let ms;
