@@ -348,6 +348,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
   const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
   const proxyUrl = connectionProxyUrl || envProxyUrl;
+  // Fail closed: a strict caller (Qoder's signed COSY request) must never fall
+  // back to a direct connection — that leaks the host IP and replays the same
+  // signature, which upstream answers with 403/"Duplicate request".
   if (proxyOptions?.strictProxy === true && !proxyUrl) {
     throw new Error("[ProxyFetch] Proxy required but no proxy URL was provided");
   }

@@ -88,6 +88,8 @@ export default function ModelSelectModal({
   capFilter = null,
   addedModelValues = [],
   closeOnSelect = true,
+  hideCombos = false,
+  onlyActiveProviders = false,
   allowProviderWildcard = false,
 }) {
   // Live-fetched connections on modal open, fallback to activeProviders prop
@@ -170,8 +172,8 @@ export default function ModelSelectModal({
   };
 
   useEffect(() => {
-    if (isOpen) fetchCombos();
-  }, [isOpen]);
+    if (isOpen && !hideCombos) fetchCombos();
+  }, [isOpen, hideCombos]);
 
   const fetchProviderNodes = async () => {
     try {
@@ -501,17 +503,17 @@ export default function ModelSelectModal({
     });
 
     return groups;
-  }, [filteredActiveProviders, modelAliases, allProviders, providerNodes, customModels, disabledModels, kindFilter, effectiveConnections, deactivatedProviderIds, cursorModels, clineModels, clinepassModels, zedModels]);
+  }, [filteredActiveProviders, modelAliases, allProviders, providerNodes, customModels, disabledModels, kindFilter, effectiveConnections, deactivatedProviderIds, onlyActiveProviders, cursorModels, clineModels, clinepassModels, zedModels]);
 
   // Parse search query into structured query (regex, positive tokens, negative tokens)
   const parsedQuery = useMemo(() => parseSearchQuery(searchQuery), [searchQuery]);
 
   // Filter combos by search query (and hide combos when kindFilter is set — combos are LLM-only by design)
   const filteredCombos = useMemo(() => {
-    if (kindFilter || capFilter) return [];
+    if (kindFilter || hideCombos || capFilter) return [];
     if (parsedQuery.isEmpty) return combos;
     return combos.filter(c => matchesSearch(c.name, parsedQuery));
-  }, [combos, parsedQuery, kindFilter, capFilter]);
+  }, [combos, parsedQuery, kindFilter, hideCombos, capFilter]);
 
   // Sort models alphabetically, with added models floated to top
   const sortModels = (models) => {
@@ -879,5 +881,7 @@ ModelSelectModal.propTypes = {
   kindFilter: PropTypes.string,
   addedModelValues: PropTypes.arrayOf(PropTypes.string),
   closeOnSelect: PropTypes.bool,
+  hideCombos: PropTypes.bool,
+  onlyActiveProviders: PropTypes.bool,
   allowProviderWildcard: PropTypes.bool,
 };
