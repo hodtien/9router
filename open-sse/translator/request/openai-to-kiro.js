@@ -20,9 +20,11 @@ import {
 import { parseDataUri } from "../concerns/image.js";
 import { DEFAULT_IMAGE_MIME } from "../schema/index.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
+import { extractForwardableSystemContent } from "../concerns/claudeCodeSystem.js";
 import {
   canonicalizeKiroConversation,
   normalizeKiroToolSpecs,
+  kiroEmptyUserContent,
 } from "../concerns/kiroConversation.js";
 
 /**
@@ -51,7 +53,8 @@ function convertMessages(messages, model) {
 
   const flushPending = () => {
     if (currentRole === "user") {
-      const content = pendingUserContent.join("\n\n").trim() || "continue";
+      const content = pendingUserContent.join("\n\n").trim()
+        || kiroEmptyUserContent(pendingToolResults.length > 0);
       const userMsg = {
         userInputMessage: {
           content: content,
@@ -106,7 +109,9 @@ function convertMessages(messages, model) {
     if (role === ROLE.USER) {
       // Extract content
       let content = "";
-      if (typeof msg.content === "string") {
+      if (msg.role === ROLE.SYSTEM) {
+        content = extractForwardableSystemContent(msg.content);
+      } else if (typeof msg.content === "string") {
         content = msg.content;
       } else if (Array.isArray(msg.content)) {
         const textParts = [];
@@ -434,6 +439,13 @@ export function openaiToKiroRequest(model, body, stream, credentials) {
     enumerable: false
   });
 
+  // Kiro tool specs get sanitized names (`mcp__a__b` → `mcp_a_b`); keep the
+  // reverse map so tool calls stream back under the client's own names.
+  const restoredToolNames = new Map();
+  for (const [original, sanitized] of nameMap) {
+    if (original !== sanitized) restoredToolNames.set(sanitized, original);
+  }
+  if (restoredToolNames.size) payload._toolNameMap = restoredToolNames;
   return payload;
 }
 

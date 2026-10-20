@@ -119,15 +119,23 @@ describe("OpenCode free-tier request contract", () => {
     expect(getObservedToolNames("opencode", "mimo-v2.5-free", "session-a")).toBeNull();
   });
 
-  it("executor applies the contract only to gated free request formats", () => {
+  // Upstream v0.5.104 (OpenCode v2) replaced the placeholder/borrowed-tool
+  // contract with the fixed read/shell fingerprint: every request carries the
+  // exact upstream definitions, and the model is told in the system prompt not
+  // to call them.
+  it("executor applies the read/shell fingerprint to chat and Responses bodies", () => {
     const executor = new OpenCodeExecutor();
     const credentials = { _opencodeContractSession: "session-a" };
 
     const chat = executor.transformRequest("mimo-v2.5-free", chatBody(), false, credentials);
     expect(chat.stream).toBe(true);
-    expect(chat.tools.map((tool) => tool.function.name)).toEqual([
-      "_noop", "bash", "glob", "grep", "read",
-    ]);
+    expect(chat.tools.map((tool) => tool.function.name)).toEqual(["read", "shell"]);
+    expect(chat.messages[0]).toMatchObject({
+      role: "system",
+      content: expect.stringMatching(/^Do not call the `read` or `shell` tools/),
+    });
+    // tool_choice "none" is answered with 403 FreeTierError upstream.
+    expect(chat.tool_choice).toBeUndefined();
 
     const responses = executor.transformRequest(
       "muse-spark-1.3-contributor-free",
@@ -135,20 +143,12 @@ describe("OpenCode free-tier request contract", () => {
       false,
       credentials,
     );
-    expect(responses.tools.map((tool) => tool.name)).toEqual([
-      "_noop", "bash", "glob", "grep", "read",
-    ]);
-
-    const anthropic = executor.transformRequest(
-      "union-alpha",
-      { model: "union-alpha", messages: [{ role: "user", content: "hi" }], max_tokens: 100 },
-      false,
-      credentials,
-    );
-    expect(anthropic).not.toHaveProperty("tools");
+    expect(responses.tools.map((tool) => tool.name)).toEqual(["read", "shell"]);
+    expect(responses.tool_choice).toBe("auto");
+    expect(responses.instructions).toMatch(/^Do not call the `read` or `shell` tools/);
   });
 
-  it("executor preserves caller tools without appending guessed names", () => {
+  it("executor preserves caller tools and appends the read/shell fingerprint", () => {
     const executor = new OpenCodeExecutor();
     const tool = { type: "function", function: { name: "client_tool", parameters: { type: "object", properties: {} } } };
     const out = executor.transformRequest(
@@ -158,28 +158,33 @@ describe("OpenCode free-tier request contract", () => {
       { _opencodeContractSession: "session-a" },
     );
     expect(out.tools[0]).toEqual(tool);
-    expect(out.tools.slice(1).map((item) => item.function.name)).toEqual([
-      "bash", "glob", "grep", "read",
-    ]);
+    expect(out.tools.slice(1).map((item) => item.function.name)).toEqual(["read", "shell"]);
   });
 
-  it("preserves Responses built-ins, custom tools, schemas and tool_choice exactly", () => {
+  it("normalizes Responses tools to flat function entries and demotes tool_choice", () => {
     const tools = [
       { type: "web_search" },
       { type: "custom", name: "patch", format: { type: "text" } },
       { type: "function", name: "lookup", strict: true, parameters: { type: "object", properties: {}, additionalProperties: false } },
     ];
-    const original = structuredClone(tools);
-    const choice = { type: "function", name: "lookup" };
     const out = new OpenCodeExecutor().transformRequest(
       "muse-spark-1.3-contributor-free",
-      { input: [{ role: "user", content: "hi" }], tools, tool_choice: choice },
+      { input: [{ role: "user", content: "hi" }], tools, tool_choice: { type: "function", name: "lookup" } },
       true,
       {},
     );
-    expect(out.tools).toBe(tools);
-    expect(out.tools).toEqual(original);
-    expect(out.tool_choice).toBe(choice);
+
+    // Built-ins without a callable name are dropped; everything else becomes a
+    // flat function entry with a JSON-Schema object.
+    expect(out.tools.map((tool) => tool.name)).toEqual(["patch", "lookup", "read", "shell"]);
+    expect(out.tools[0]).toEqual({ type: "function", name: "patch", parameters: { type: "object", properties: {} } });
+    expect(out.tools[1]).toEqual({
+      type: "function",
+      name: "lookup",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    });
+    // muse-spark-1.3-contributor-free is auto-only upstream.
+    expect(out.tool_choice).toBe("auto");
   });
 
   it("routes union-alpha through the registered Claude Messages transport", () => {
@@ -200,8 +205,8 @@ describe("OpenCode free-tier request contract", () => {
     const out = executor.transformRequest("union-alpha", translated, true, {});
 
     expect(target).toBe(FORMATS.CLAUDE);
-    expect(executor.buildUrl("union-alpha")).toBe("https://opencode.ai/zen/v1/messages");
-    expect(executor.buildHeaders({}, true, "https://opencode.ai/zen/v1/messages", "union-alpha")["anthropic-version"]).toBe("2023-06-01");
+    expect(executor.buildUrl("union-alpha")).toBe("https://opencode.ai/inference/v1/messages");
+    expect(executor.buildHeaders({}, true, executor.buildUrl("union-alpha"))["anthropic-version"]).toBe("2023-06-01");
     expect(out.tools[0]).toMatchObject({ name: "lookup", input_schema: { type: "object" } });
     expect(out.tools[0]).not.toHaveProperty("function");
     expect(out.messages[0]).toMatchObject({ role: "user", content: [{ type: "text", text: "hi" }] });
@@ -213,14 +218,13 @@ describe("OpenCode free-tier request contract", () => {
     const headers = executor.buildHeaders(
       {},
       false,
-      "https://opencode.ai/zen/v1/chat/completions",
-      "paid-model",
+      "https://opencode.ai/inference/v1/chat/completions",
     );
 
     expect(headers.Accept).toBe("*/*");
   });
 
-  it("does not force stream or inject tools for paid OpenCode models", () => {
+  it("forces streaming and the fingerprint for paid OpenCode models too", () => {
     const out = new OpenCodeExecutor().transformRequest(
       "paid-model",
       { model: "paid-model", messages: [{ role: "user", content: "hi" }] },
@@ -228,13 +232,13 @@ describe("OpenCode free-tier request contract", () => {
       { _opencodeContractSession: "session-a" },
     );
 
-    expect(out.stream).toBe(false);
-    expect(out).not.toHaveProperty("tools");
+    expect(out.stream).toBe(true);
+    expect(out.tools.map((tool) => tool.function.name)).toEqual(["read", "shell"]);
   });
 
-  it("does not declare provider-wide streaming", async () => {
+  it("declares provider-wide streaming", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
-    expect(PROVIDERS.opencode?.forceStream).toBeUndefined();
+    expect(PROVIDERS.opencode?.forceStream).toBe(true);
   });
 
   it("preserves the complete Responses terminal payload", async () => {

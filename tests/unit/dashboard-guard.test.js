@@ -37,13 +37,17 @@ const { proxy, __test__ } = await import("../../src/dashboardGuard.js");
 
 const PEER_TOKEN = "peer-token-fixture";
 
-function request(pathname, headers = {}) {
+function request(pathname, headers = {}, { method = "GET", authToken } = {}) {
   const normalizedHeaders = new Headers(headers);
+  const protocol = normalizedHeaders.get("x-forwarded-proto") || "http";
+  const host = normalizedHeaders.get("host") || "localhost";
+  const url = new URL(pathname, `${protocol}://${host}`);
   return {
-    nextUrl: { pathname, searchParams: new URL(`http://localhost${pathname}`).searchParams },
+    nextUrl: url,
     headers: normalizedHeaders,
-    cookies: { get: vi.fn(() => undefined) },
-    url: `http://localhost${pathname}`,
+    method,
+    cookies: { get: vi.fn((name) => name === "auth_token" && authToken ? { value: authToken } : undefined) },
+    url: url.toString(),
   };
 }
 
@@ -284,6 +288,43 @@ describe("dashboard guard local-only access", () => {
     }));
 
     expect(response).toBe(mocks.nextResponse);
+  });
+
+  it("allows remote OpenCode profile refresh with a valid session and same-origin request", async () => {
+    mocks.verifyDashboardAuthToken.mockResolvedValue(true);
+
+    const response = await proxy(request("/api/cli-tools/opencode-profile", {
+      host: "router.example.com",
+      "x-forwarded-proto": "https",
+      origin: "https://router.example.com",
+    }, { method: "POST", authToken: "valid-session" }));
+
+    expect(response).toBe(mocks.nextResponse);
+    expect(mocks.verifyDashboardAuthToken).toHaveBeenCalledWith("valid-session");
+  });
+
+  it.each([undefined, "https://evil.example.com"])("rejects remote OpenCode profile refresh with Origin %s", async (origin) => {
+    mocks.verifyDashboardAuthToken.mockResolvedValue(true);
+
+    const response = await proxy(request("/api/cli-tools/opencode-profile", {
+      host: "router.example.com",
+      "x-forwarded-proto": "https",
+      ...(origin ? { origin } : {}),
+    }, { method: "POST", authToken: "valid-session" }));
+
+    expect(response.status).toBe(403);
+  });
+
+  it("keeps other local-only routes inaccessible to a remote dashboard session", async () => {
+    mocks.verifyDashboardAuthToken.mockResolvedValue(true);
+
+    const response = await proxy(request("/api/cli-tools/antigravity-mitm", {
+      host: "router.example.com",
+      "x-forwarded-proto": "https",
+      origin: "https://router.example.com",
+    }, { method: "POST", authToken: "valid-session" }));
+
+    expect(response.status).toBe(403);
   });
 });
 

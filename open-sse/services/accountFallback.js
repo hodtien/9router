@@ -20,7 +20,7 @@ export function getQuotaCooldown(backoffLevel = 0) {
  * @param {number} backoffLevel - Current backoff level for exponential backoff
  * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number }}
  */
-export function checkFallbackError(status, errorText, backoffLevel = 0) {
+export function checkFallbackError(status, errorText, backoffLevel = 0, provider = null) {
   const lowerError = errorText
     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
     : "";
@@ -34,6 +34,7 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
   }
 
   for (const rule of ERROR_RULES) {
+    if (rule.provider && rule.provider !== provider) continue;
     // Text-based rule: match substring in error message
     if (rule.text && lowerError && lowerError.includes(rule.text)) {
       if (rule.backoff) {
@@ -53,6 +54,20 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
     }
   }
 
+  // Request-scoped client errors that matched no rule above: a 400 caused by the
+  // request itself (context overflow, malformed body, unsupported parameter) says
+  // nothing about the credential, so cooling the account down only removes a
+  // healthy connection from rotation. With a single connection it is worse: every
+  // later request in the window fails with a copy of this very error
+  // ("all 1 accounts locked for <model> | lastError=[400]: ..."), which hides the
+  // real cause from the caller and makes unrelated sessions look like they hit the
+  // same limit. Hand the upstream error back for this request instead.
+  // Account-scoped statuses keep their rules above (401/402/403/404/429), and the
+  // text rules still win for rate-limit / quota / capacity wording.
+  if (status >= 400 && status < 500 && status !== 401 && status !== 402 && status !== 403 && status !== 429) {
+    return { shouldFallback: false, cooldownMs: 0 };
+  }
+
   // Default: transient cooldown for any unmatched error
   return { shouldFallback: true, cooldownMs: TRANSIENT_COOLDOWN_MS };
 }
@@ -63,6 +78,28 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
 export function isAccountUnavailable(unavailableUntil) {
   if (!unavailableUntil) return false;
   return new Date(unavailableUntil).getTime() > Date.now();
+}
+
+/**
+ * Decide whether an all-accounts-in-cooldown result should be waited out
+ * internally instead of surfaced to the client.
+ *
+ * Returns the wait in ms when the earliest unlock is close enough that retrying
+ * is likely to find a usable account, otherwise 0. Bounded by the caller's
+ * budget so an exhausted pool still fails fast.
+ *
+ * @param {string|null} retryAfter - ISO timestamp of the earliest unlock
+ * @param {number} budgetMs - Maximum total time we're willing to wait
+ * @param {number} now - Injectable clock for tests
+ */
+export function planCooldownRetry(retryAfter, budgetMs, now = Date.now()) {
+  if (!retryAfter || !(budgetMs > 0)) return 0;
+  const unlockAt = new Date(retryAfter).getTime();
+  if (!Number.isFinite(unlockAt)) return 0;
+  const waitMs = unlockAt - now;
+  // Already unlocked, or too far out to be worth holding the request open.
+  if (waitMs <= 0 || waitMs > budgetMs) return 0;
+  return waitMs;
 }
 
 /**

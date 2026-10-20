@@ -120,7 +120,7 @@ export default function RequestDetailsTab() {
 
   const fetchProviders = useCallback(async () => {
     try {
-      const res = await fetch("/api/usage/providers");
+      const res = await fetch("/api/usage/providers", { credentials: "include" });
       const data = await res.json();
       setProviders(data.providers || []);
 
@@ -142,7 +142,7 @@ export default function RequestDetailsTab() {
       if (filters.startDate) params.append("startDate", filters.startDate);
       if (filters.endDate) params.append("endDate", filters.endDate);
 
-      const res = await fetch(`/api/usage/request-details?${params}`);
+      const res = await fetch(`/api/usage/request-details?${params}`, { credentials: "include" });
       const data = await res.json();
 
       setDetails(data.details || []);
