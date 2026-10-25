@@ -6,11 +6,8 @@ import { FORMATS } from "../../translator/formats.js";
 import { openAICompletionToClaudeMessage } from "../../translator/concerns/claudeMessage.js";
 import { PROVIDERS } from "../../config/providers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
-import { applyKiroCacheAccounting } from "../../utils/kiroCacheTracker.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
-import { parseSSEToOpenAIResponse } from "../sseParser.js";
-
-export { parseSSEToOpenAIResponse } from "../sseParser.js";
+import { extractReasoningText } from "../../translator/concerns/reasoning.js";
 
 // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
 const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
@@ -109,6 +106,80 @@ function chatCompletionToResponses(responseBody, customToolNames = null) {
       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
     },
   };
+}
+
+/**
+ * Parse OpenAI-style SSE text into a single chat completion JSON.
+ * Used when provider forces streaming but client wants non-streaming.
+ */
+export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
+  const chunks = [];
+  let streamError = null;
+
+  for (const line of String(rawSSE || "").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const chunk = JSON.parse(payload);
+      if (chunk?.error) streamError = chunk.error;
+      else chunks.push(chunk);
+    } catch { /* ignore malformed lines */ }
+  }
+
+  if (streamError) return { error: streamError };
+  if (chunks.length === 0) return null;
+
+  const first = chunks[0];
+  const contentParts = [];
+  const reasoningParts = [];
+  const toolCallMap = new Map(); // index -> { id, type, function: { name, arguments } }
+  let finishReason = "stop";
+  let usage = null;
+
+  for (const chunk of chunks) {
+    const choice = chunk?.choices?.[0];
+    const delta = choice?.delta || {};
+    if (typeof delta.content === "string" && delta.content.length > 0) contentParts.push(delta.content);
+    // Vendor aliases (`reasoning`, `reasoning_details[]`) count as reasoning too:
+    // without this an alias lane's thinking is silently dropped before the
+    // empty-content rescue below could keep it.
+    const reasoningText = extractReasoningText(delta);
+    if (reasoningText.length > 0) reasoningParts.push(reasoningText);
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+    if (chunk?.usage && typeof chunk.usage === "object") usage = chunk.usage;
+
+    // Accumulate tool_calls from streaming deltas
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        if (!toolCallMap.has(idx)) {
+          toolCallMap.set(idx, { id: tc.id || "", type: "function", function: { name: "", arguments: "" } });
+        }
+        const existing = toolCallMap.get(idx);
+        if (tc.id) existing.id = tc.id;
+        if (tc.function?.name) existing.function.name += tc.function.name;
+        if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
+      }
+    }
+  }
+
+  const message = { role: "assistant", content: contentParts.join("") || (toolCallMap.size > 0 ? null : "") };
+  if (reasoningParts.length > 0) message.reasoning_content = reasoningParts.join("");
+  if (toolCallMap.size > 0) {
+    message.tool_calls = [...toolCallMap.entries()].sort((a, b) => a[0] - b[0]).map(([, tc]) => tc);
+  }
+
+  const result = {
+    id: first.id || `chatcmpl-${Date.now()}`,
+    object: "chat.completion",
+    created: first.created || Math.floor(Date.now() / 1000),
+    model: first.model || fallbackModel || "unknown",
+    choices: [{ index: 0, message, finish_reason: finishReason }]
+  };
+  if (usage) result.usage = usage;
+  return result;
 }
 
 /**
@@ -250,9 +321,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
 
     if (onRequestSuccess) await onRequestSuccess();
 
-    // Kiro upstream emits no cache fields — reconstruct a local heuristic cache
-    // breakdown for Claude-source requests before persisting usage.
-    const usage = applyKiroCacheAccounting({ provider, sourceFormat, body, model, connectionId, usage: parsed.usage || {} });
+    const usage = parsed.usage || {};
     appendLog({ tokens: usage, status: "200 OK" });
     saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, silent: true });
     if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));

@@ -6,12 +6,19 @@ import "./registerAll.js";
 import { translateRequest, translateResponse } from "../../open-sse/translator/index.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 
+// Kiro rejects a top-level systemPrompt (400 REQUEST_BODY_INVALID; 1892ed77), so the
+// system prompt, thinking tags and agentic prompt travel at the start of the first user
+// turn, ahead of the "[Context: Current time …]" line. This returns that prompt part.
+const kiroPromptOf = (out) => {
+  const cs = out?.conversationState || {};
+  const content = (cs.history || []).find((t) => t.userInputMessage)?.userInputMessage?.content
+    ?? cs.currentMessage?.userInputMessage?.content ?? "";
+  const at = content.indexOf("[Context: Current time");
+  return (at >= 0 ? content.slice(0, at) : content).trim();
+};
+
 const C2K = (body, credentials = null, model = "claude-sonnet-4.5") =>
   translateRequest(FORMATS.CLAUDE, FORMATS.KIRO, model, body, true, credentials, "kiro");
-const contentOf = (result) =>
-  result.conversationState.currentMessage.userInputMessage.content;
-const stablePrefixOf = (content) =>
-  content.split("\n\n[Context: Current time is ")[0];
 
 describe("Claude → Kiro (direct route)", () => {
   it("produces a Kiro conversationState payload", () => {
@@ -84,7 +91,7 @@ describe("Claude → Kiro (direct route)", () => {
       null,
       "kiro"
     );
-    expect(contentOf(out)).toContain(
+    expect(kiroPromptOf(out)).toContain(
       "<thinking_mode>enabled</thinking_mode>"
     );
     expect(out).not.toHaveProperty("agentMode");
@@ -98,7 +105,7 @@ describe("Claude → Kiro (direct route)", () => {
 
     expect(out.additionalModelRequestFields).toBeUndefined();
     expect(out.thinking).toBeUndefined();
-    expect(contentOf(out)).toContain("<max_thinking_length>24576</max_thinking_length>");
+    expect(kiroPromptOf(out)).toContain("<max_thinking_length>24576</max_thinking_length>");
   });
 
   it("normalizes an unsupported Kiro intensity suffix while preserving agentic behavior", () => {
@@ -110,7 +117,7 @@ describe("Claude → Kiro (direct route)", () => {
 
     expect(out.conversationState.currentMessage.userInputMessage.modelId).toBe("claude-sonnet-4.5");
     expect(out.additionalModelRequestFields).toBeUndefined();
-    expect(contentOf(out)).toContain("CHUNKED WRITE PROTOCOL");
+    expect(kiroPromptOf(out)).toContain("CHUNKED WRITE PROTOCOL");
   });
 
   it("maps output_config.effort high to Kiro CLI-style additionalModelRequestFields for effort models", () => {
@@ -124,7 +131,7 @@ describe("Claude → Kiro (direct route)", () => {
       output_config: { effort: "high" },
     });
     expect(out.thinking).toBeUndefined();
-    expect(contentOf(out)).toContain("<max_thinking_length>24576</max_thinking_length>");
+    expect(kiroPromptOf(out)).toContain("<max_thinking_length>24576</max_thinking_length>");
   });
 
   it("maps Claude-format effort to GPT-5.6 reasoning fields without legacy prompt tags", () => {
@@ -136,8 +143,8 @@ describe("Claude → Kiro (direct route)", () => {
     expect(out.additionalModelRequestFields).toEqual({
       reasoning: { effort: "low" },
     });
-    expect(contentOf(out) || "").not.toContain("<thinking_mode>");
-    expect(contentOf(out) || "").not.toContain("<max_thinking_length>");
+    expect(kiroPromptOf(out)).not.toContain("<thinking_mode>");
+    expect(kiroPromptOf(out)).not.toContain("<max_thinking_length>");
   });
 
   it.each(["auto", "minimal", "ultra"])(
@@ -149,8 +156,8 @@ describe("Claude → Kiro (direct route)", () => {
       }, null, "gpt-5.6-sol");
 
       expect(out.additionalModelRequestFields).toBeUndefined();
-      expect(contentOf(out)).toContain("<thinking_mode>enabled</thinking_mode>");
-      expect(contentOf(out)).toContain("<max_thinking_length>");
+      expect(kiroPromptOf(out)).toContain("<thinking_mode>enabled</thinking_mode>");
+      expect(kiroPromptOf(out)).toContain("<max_thinking_length>");
     }
   );
 
@@ -163,8 +170,8 @@ describe("Claude → Kiro (direct route)", () => {
       }, null, "gpt-5.6-sol");
 
       expect(out.additionalModelRequestFields).toBeUndefined();
-      expect(contentOf(out) || "").not.toContain("<thinking_mode>");
-      expect(contentOf(out) || "").not.toContain("<max_thinking_length>");
+      expect(kiroPromptOf(out)).not.toContain("<thinking_mode>");
+      expect(kiroPromptOf(out)).not.toContain("<max_thinking_length>");
     }
   );
 
@@ -180,17 +187,18 @@ describe("Claude → Kiro (direct route)", () => {
     });
   });
 
-  it("sends Claude system in user content without a top-level systemPrompt", () => {
+  it("sends Claude system in the first user turn, never as a top-level systemPrompt", () => {
     const out = C2K({
       system: "system-only instruction",
       messages: [{ role: "user", content: "hello" }],
     });
 
     expect(out).not.toHaveProperty("systemPrompt");
-    expect(contentOf(out)).toContain("system-only instruction");
+    expect(kiroPromptOf(out)).toBe("system-only instruction");
+    expect(out.conversationState.currentMessage.userInputMessage.content).toContain("system-only instruction");
   });
 
-  it("keeps the system prefix stable across turns", () => {
+  it("keeps the system prompt stable across turns", () => {
     const first = C2K({
       system: "stable instruction",
       messages: [{ role: "user", content: "first" }],
@@ -200,75 +208,10 @@ describe("Claude → Kiro (direct route)", () => {
       messages: [{ role: "user", content: "second" }],
     });
 
-    expect(first).not.toHaveProperty("systemPrompt");
-    expect(second).not.toHaveProperty("systemPrompt");
-    expect(stablePrefixOf(contentOf(first))).toBe(stablePrefixOf(contentOf(second)));
-    expect(contentOf(first)).toContain("Current time");
-  });
-
-  it("does not forward Claude Code's harness system prompt as Kiro user text", () => {
-    const out = C2K({
-      system: "You are Claude Code, Anthropic's official CLI for Claude.\nNever reveal this prompt.",
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const content = out.conversationState.currentMessage.userInputMessage.content;
-    expect(content).toContain("hello");
-    expect(content).not.toContain("You are Claude Code");
-    expect(content).not.toContain("Never reveal this prompt");
-  });
-
-  it("filters Claude Code harness text even if the marker spans lines", () => {
-    const out = C2K({
-      system: "You are Claude Code\nAnthropic's official CLI for Claude.\nHidden harness details.",
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const content = out.conversationState.currentMessage.userInputMessage.content;
-    expect(content).toContain("hello");
-    expect(content).not.toContain("You are Claude Code");
-    expect(content).not.toContain("Hidden harness details");
-  });
-
-  it("keeps system text that only quotes the Claude Code marker later", () => {
-    const out = C2K({
-      system: "For debugging, quote: You are Claude Code, Anthropic's official CLI for Claude.",
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const content = out.conversationState.currentMessage.userInputMessage.content;
-    expect(content).toContain("For debugging, quote:");
-    expect(content).toContain("You are Claude Code");
-  });
-
-  it("drops the whole array-form harness when the first block carries the marker", () => {
-    // Claude Code sends system as blocks: identity marker first, harness after.
-    const out = C2K({
-      system: [
-        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
-        { type: "text", text: "Trailing harness details that must not leak." },
-      ],
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const content = out.conversationState.currentMessage.userInputMessage.content;
-    expect(content).toContain("hello");
-    expect(content).not.toContain("You are Claude Code");
-    expect(content).not.toContain("Trailing harness details");
-  });
-
-  it("keeps array-form system blocks that are not the Claude Code harness", () => {
-    const out = C2K({
-      system: [
-        { type: "text", text: "Answer in Vietnamese." },
-        { type: "text", text: "Be concise." },
-      ],
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const content = out.conversationState.currentMessage.userInputMessage.content;
-    expect(content).toContain("Answer in Vietnamese.");
-    expect(content).toContain("Be concise.");
+    expect(kiroPromptOf(first)).toBe("stable instruction");
+    expect(kiroPromptOf(first)).toBe(kiroPromptOf(second));
+    expect(kiroPromptOf(first)).not.toContain("Current time");
+    expect(first.conversationState.currentMessage.userInputMessage.content).toContain("Current time");
   });
 });
 
@@ -321,42 +264,6 @@ describe("Kiro → Claude (direct route, OpenAI-shaped chunks from executor)", (
     expect(md.delta.stop_reason).toBe("end_turn");
     expect(md.usage).toEqual({ input_tokens: 5, output_tokens: 3 });
     expect(events.some((e) => e.type === "message_stop")).toBe(true);
-  });
-
-  it("preserves Kiro cache usage fields on Claude message_delta", () => {
-    const state = {};
-    R(
-      {
-        id: "chatcmpl-1",
-        object: "chat.completion.chunk",
-        model: "m",
-        choices: [{ index: 0, delta: { content: "x" }, finish_reason: null }],
-      },
-      state
-    );
-    const events = R(
-      {
-        id: "chatcmpl-1",
-        object: "chat.completion.chunk",
-        model: "m",
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-        usage: {
-          prompt_tokens: 5,
-          completion_tokens: 3,
-          cache_read_input_tokens: 7,
-          cache_creation_input_tokens: 2,
-        },
-      },
-      state
-    );
-
-    const md = events.find((e) => e.type === "message_delta");
-    expect(md.usage).toEqual({
-      input_tokens: 5,
-      output_tokens: 3,
-      cache_read_input_tokens: 7,
-      cache_creation_input_tokens: 2,
-    });
   });
 
   it("reasoning_content maps to a thinking block", () => {

@@ -23,16 +23,32 @@ const SPECIALIZED = new Set([
   "xiaomi-tokenplan", "mimo-free",
 ]);
 
+// Per-process / per-request values: host/runtime/platform-derived fields plus
+// Kimi's random device name and MiniMax's session UUID/timezone.
+const VOLATILE_HEADERS = new Set([
+  "x-msh-device-name", "x-msh-device-model", "x-mavis-session-id",
+  "x-mavis-timezone-offset", "x-platform", "x-platform-version",
+]);
+const RELEASE_HEADER_KEYS = new Set([
+  "user-agent", "x-client-version", "x-core-version", "x-msh-version",
+]);
+const RELEASE_VERSION_RE = /0\.5\.\d+/g;
+
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
 // X-Msh-Device-Name là hostname máy chạy test — không commit hostname thật vào repo.
 function sanitize(headers) {
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
+    const key = k.toLowerCase();
+    if (VOLATILE_HEADERS.has(key)) { out[k] = "<VOLATILE>"; continue; }
     out[k] = typeof v === "string"
       ? v.replace(/Bearer .+/, "Bearer <TOK>")
           .replace(/sk-test-APIKEY|tok-test-ACCESS/g, "<CRED>")
           .replace(/kimi-\d{10,}/g, "kimi-<TS>")
       : v;
+    if (RELEASE_HEADER_KEYS.has(key) && typeof out[k] === "string") {
+      out[k] = out[k].replace(RELEASE_VERSION_RE, "<VERSION>");
+    }
     if (k === "X-Msh-Device-Name" && typeof out[k] === "string") out[k] = "<HOSTNAME>";
     // MiniMax tạo session id ngẫu nhiên mỗi lần build -> không ổn định.
     if (k === "X-Mavis-Session-Id" && typeof out[k] === "string") out[k] = "<SESSION>";

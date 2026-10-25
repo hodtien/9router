@@ -1,9 +1,8 @@
 // Guards forceStream moved from chatCore hardcode → PROVIDERS schema (#5).
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { executeMock, parseUpstreamErrorMock } = vi.hoisted(() => ({
+const { executeMock } = vi.hoisted(() => ({
   executeMock: vi.fn(),
-  parseUpstreamErrorMock: vi.fn(),
 }));
 
 vi.mock("../../open-sse/executors/index.js", () => ({
@@ -72,6 +71,7 @@ vi.mock("../../open-sse/rtk/index.js", () => ({
 vi.mock("../../open-sse/rtk/headroom.js", () => ({
   compressWithHeadroom: vi.fn(async () => null),
   formatHeadroomLog: vi.fn(() => ""),
+  // chatCore also imports these (fb543a1f); a mock missing them fails the import.
   formatHeadroomSizeLog: vi.fn(() => ""),
   isHeadroomPhantomSavings: vi.fn(() => false),
 }));
@@ -96,7 +96,7 @@ vi.mock("../../open-sse/handlers/chatCore/requestDetail.js", () => ({
 vi.mock("../../open-sse/utils/error.js", () => ({
   createErrorResult: vi.fn((status, message) => ({ success: false, status, error: message })),
   formatProviderError: vi.fn((error) => error.message),
-  parseUpstreamError: parseUpstreamErrorMock,
+  parseUpstreamError: vi.fn(),
 }));
 
 vi.mock("@/lib/usageDb.js", () => ({
@@ -128,7 +128,10 @@ function makeOptions(bodyStream) {
   };
 }
 
-describe("forceStream provider config", () => {
+// The first test pays for importing chatCore's module graph (3s+ under full-suite
+// load); a test that times out keeps running and its late fetch call leaks into the
+// next test's mock counts, so give the file room instead of cascading failures.
+describe("forceStream provider config", { timeout: 20_000 }, () => {
   beforeEach(() => {
     executeMock.mockReset();
     executeMock.mockRejectedValue(new Error("boom"));
@@ -152,32 +155,5 @@ describe("forceStream provider config", () => {
 
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(executeMock.mock.calls[0][0].stream).toBe(true);
-  });
-
-  it("passes raw upstream error bodies to the provider-error callback", async () => {
-    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
-    const body = JSON.stringify({ type: "FreeUsageLimitError", message: "rate limit exceeded" });
-    const onProviderError = vi.fn();
-    executeMock.mockResolvedValue({
-      response: new Response(body, { status: 429, headers: { "content-type": "application/json" } }),
-      url: "https://upstream.test",
-      headers: {},
-      transformedBody: {},
-    });
-    parseUpstreamErrorMock.mockResolvedValue({ statusCode: 429, message: "rate limit exceeded" });
-
-    await handleChatCore({
-      ...makeOptions(false),
-      modelInfo: { provider: "opencode", model: "muse-spark-1.3-contributor-free" },
-      onProviderError,
-    });
-
-    expect(onProviderError).toHaveBeenCalledWith(expect.objectContaining({
-      provider: "opencode",
-      model: "muse-spark-1.3-contributor-free",
-      status: 429,
-      bodyText: body,
-      message: "rate limit exceeded",
-    }));
   });
 });
