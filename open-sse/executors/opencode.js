@@ -1,8 +1,5 @@
 import crypto from "crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { BaseExecutor } from "./base.js";
-import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { PROVIDERS } from "../config/providers.js";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
@@ -10,6 +7,7 @@ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
+import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
@@ -28,49 +26,6 @@ const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
-// Transport failures carry a stable internal code so callers can tell a
-// spawn failure from a malformed metadata frame. The raw stderr stays
-// non-enumerable: it can carry upstream details that must not be logged.
-function transportError(message, code, cause = null, stderr = "") {
-  const error = new Error(message);
-  error.code = code;
-  if (cause) error.cause = cause;
-  if (stderr) Object.defineProperty(error, "stderr", { value: stderr.slice(0, 500), enumerable: false });
-  return error;
-}
-
-// The Bun script is resolved from OPENCODE_FETCHER_PATH first, then from the
-// runtime directory: Next.js rewrites `import.meta.url`, so a path derived
-// from it is useless at runtime.
-function resolveBunFetcherPath() {
-  const candidates = [
-    process.env.OPENCODE_FETCHER_PATH?.trim(),
-    path.join(process.cwd(), "open-sse", "executors", "_opencode-fetcher.js"),
-    path.join(process.cwd(), "_opencode-fetcher.js"),
-  ].filter(Boolean);
-  for (const candidate of candidates) {
-    try {
-      if (fs.statSync(candidate).isFile()) return candidate;
-    } catch { /* try the next candidate */ }
-  }
-  return null;
-}
-
-// BUN_BIN may point at a binary the service user cannot read (e.g. a root
-// install behind ProtectHome). Fall back to the bundled runtime, then PATH.
-function resolveBunBin() {
-  const candidates = [
-    process.env.BUN_BIN?.trim(),
-    path.join(process.cwd(), ".runtime", "bun"),
-  ].filter(Boolean);
-  for (const candidate of candidates) {
-    try {
-      if (fs.statSync(candidate).isFile()) return candidate;
-    } catch { /* try the next candidate */ }
-  }
-  return "bun";
-}
 
 function hasValidOpencodeVersion(ua) {
   const m = String(ua || "").match(/^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i);
@@ -99,7 +54,6 @@ function unstableRandom() {
 // Upstream decodes it and rejects a non-small counter with 403 FreeTierError
 // (live probes: counter 0–16 pass, >=100 fail), so the counter must stay real.
 const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
-const SESSION_TIME_MASK = (1n << 36n) - 1n;
 
 function descendingTimeHex(time, counterValue) {
   return (~(BigInt(time) * 0x1000n + BigInt(counterValue)) & SESSION_PREFIX_MASK)
@@ -116,22 +70,40 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${descendingTimeHex(timestamp, counter)}${unstableRandom()}`;
 }
 
+// Upstream decodes the prefix timestamp and refuses sessions whose time is in
+// the future or older than the free-tier window (live probes 2026-10-26: a
+// Date.now() session passed 10/10 while digest-derived ones passed 1/10). A
+// digest is uniform over 2^36 ms, so most translated ids were refused even
+// though their shape matched. Mint with the current time and memoize per
+// conversation so a conversation keeps one stable, valid session.
+const translatedOpencodeSessions = new Map();
+const MAX_TRANSLATED_SESSIONS = 5000;
+const translatedSessionCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of translatedOpencodeSessions) {
+    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) {
+      translatedOpencodeSessions.delete(key);
+    }
+  }
+}, MEMORY_CONFIG.sessionCleanupIntervalMs);
+if (translatedSessionCleanup.unref) translatedSessionCleanup.unref();
+
 export function translateSessionId(sessionId, clientTool = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
-  const digest = crypto
-    .createHash("sha256")
-    .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
-    .digest();
-  // Deterministic time field from the digest, counter pinned to 1 (what the CLI sends).
-  const time = BigInt(`0x${digest.subarray(0, 5).toString("hex")}`) & SESSION_TIME_MASK;
-  const timeHex = descendingTimeHex(time, 1);
-  let randomPart = "";
-  for (let i = 6; i < 20; i++) {
-    randomPart += BASE62_CHARS[digest[i] % 62];
+  const key = `${clientTool || "generic"}\0${sessionId || ""}`;
+  const existing = translatedOpencodeSessions.get(key);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    return existing.sessionId;
   }
-  return `ses_${timeHex}${randomPart}`;
+  const translated = `ses_${descendingTimeHex(Date.now(), 1)}${unstableRandom()}`;
+  if (translatedOpencodeSessions.size >= MAX_TRANSLATED_SESSIONS) {
+    translatedOpencodeSessions.delete(translatedOpencodeSessions.keys().next().value);
+  }
+  translatedOpencodeSessions.set(key, { sessionId: translated, lastUsed: Date.now() });
+  return translated;
 }
 
 function normalizeSession(value) {
@@ -425,130 +397,26 @@ export class OpenCodeExecutor extends BaseExecutor {
       applyFingerprintTools(body, true);
     } else if (body && typeof body === "object") {
       dropAdaptiveReasoningEffort(body);
-      applyFingerprintTools(body, false);
+      applyFingerprintTools(body, false, { claude: isMessagesModel(model || body?.model) });
     }
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
+  // The free gate keys on the TLS ClientHello, so a native Node fetch is refused
+  // no matter how faithful the body is. Route through the impersonating client
+  // and keep proxy handling on the existing path (proxyAwareFetch delegates to
+  // `directFetch` when no proxy is configured). Fail-open: without wreq-js the
+  // request still goes out on native fetch instead of erroring here.
   async execute(args) {
-    // The Bun transport is opt-in via OPENCODE_FETCHER_PATH: it exists for
-    // deployments whose egress is answered with 403 by the native TLS stack.
-    if (process.env.OPENCODE_FETCHER_PATH?.trim()) {
-      return this.executeViaBun(args);
-    }
-    return super.execute({ ...args, credentials: this.prepareRequestCredentials(args) });
-  }
-
-  // ponytail: opencode's free-tier gate fingerprints the TLS ClientHello, so
-  // Node's undici stack is answered with 403 even with correct headers. When
-  // OPENCODE_FETCHER_PATH points at the Bun script, the request runs through
-  // Bun's TLS stack in a child process; otherwise the native fetch path is used.
-  // Per-request Bun spawn costs ~30ms cold; promote to a long-lived child when
-  // throughput demands it.
-  async executeViaBun({ model, body, stream, credentials, signal, providerSessionId, clientTool, proxyOptions }) {
-    const preparedCredentials = this.prepareRequestCredentials({ body, credentials, providerSessionId, clientTool });
-    const url = this.buildUrl(model, stream, 0, preparedCredentials);
-    const transformedBody = this.transformRequest(model, body, stream, preparedCredentials);
-    const upstreamStream = transformedBody?.stream === true;
-    const headers = this.buildHeaders(preparedCredentials, upstreamStream, url);
-
-    const scriptPath = resolveBunFetcherPath();
-    if (!scriptPath) {
-      throw new Error("opencode Bun fetcher: script not found. Set OPENCODE_FETCHER_PATH to _opencode-fetcher.js.");
-    }
-
-    // strictProxy is read here, not from the serialized input: `input` is the
-    // JSON string written to stdin, so a guard on it would be dead code.
-    const strictProxy = proxyOptions?.strictProxy === true;
-    const input = JSON.stringify({
-      url,
-      headers,
-      body: JSON.stringify(transformedBody),
-      stream: upstreamStream,
-      proxyUrl: proxyOptions?.connectionProxyEnabled ? proxyOptions.connectionProxyUrl : "",
-      strictProxy,
-      vercelRelayUrl: proxyOptions?.vercelRelayUrl || "",
-    });
-
-    const child = (await import("node:child_process")).spawn(resolveBunBin(), ["--cwd=/tmp", scriptPath], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-      // ponytail: Bun refuses to run when its captured parent-cwd was deleted
-      // (e.g. after a deploy rotated /opt/groxy/app). Pin Bun's internal cwd
-      // to /tmp via --cwd= so the spawn survives such rotations.
-    });
-
-    if (signal) {
-      const onAbort = () => { if (!child.killed) child.kill("SIGTERM"); };
-      signal.addEventListener("abort", onAbort, { once: true });
-      child.on("close", () => signal.removeEventListener?.("abort", onAbort));
-    }
-
-    child.stdin.end(input);
-
-    // The free tier always streams upstream (transport.forceStream), so the
-    // child always writes a metadata line followed by the raw SSE bytes.
-    // Wait for that line before constructing Response: returning early would
-    // default every upstream error to HTTP 200 and turn its body into an
-    // apparently successful empty SSE stream.
-    return new Promise((resolve, reject) => {
-      let headerBuf = Buffer.alloc(0);
-      let controller = null;
-      let stderr = "";
-      let ended = false;
-
-      child.stdout.on("data", (chunk) => {
-        if (ended) return;
-        if (controller) {
-          controller.enqueue(chunk);
-          return;
-        }
-        headerBuf = Buffer.concat([headerBuf, chunk]);
-        const nl = headerBuf.indexOf(0x0a);
-        if (nl < 0) return;
-
-        let metadata;
-        try {
-          metadata = JSON.parse(headerBuf.slice(0, nl).toString("utf8"));
-        } catch (error) {
-          ended = true;
-          reject(transportError("opencode Bun fetcher: bad metadata", "OPENCODE_TRANSPORT_METADATA", error));
-          return;
-        }
-        const tail = headerBuf.slice(nl + 1);
-        const responseBody = new ReadableStream({
-          start(streamController) {
-            controller = streamController;
-            if (tail.length) controller.enqueue(tail);
-          },
-          cancel() {
-            ended = true;
-            if (!child.killed) child.kill("SIGTERM");
-          },
-        });
-        resolve({
-          response: new Response(responseBody, { status: metadata.status, headers: metadata.headers || {} }),
-          url, headers, transformedBody,
-        });
-      });
-      child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
-      child.on("error", (error) => {
-        if (ended) return;
-        ended = true;
-        if (controller) controller.error(transportError("opencode Bun fetcher spawn failed", "OPENCODE_TRANSPORT_SPAWN", error));
-        else reject(transportError("opencode Bun fetcher spawn failed", "OPENCODE_TRANSPORT_SPAWN", error));
-      });
-      child.on("close", (code) => {
-        if (ended) return;
-        ended = true;
-        if (!controller) {
-          reject(transportError(`opencode Bun fetcher exited before metadata (exit=${code})`, "OPENCODE_TRANSPORT_METADATA", null, stderr));
-        } else if (code !== 0) {
-          controller.error(transportError(`opencode Bun fetcher exit=${code}`, "OPENCODE_TRANSPORT_METADATA", null, stderr));
-        } else {
-          controller.close();
-        }
-      });
+    const credentials = this.prepareRequestCredentials(args);
+    return super.execute({
+      ...args,
+      credentials,
+      directFetch: (url, options) => opencodeTlsFetch(url, {
+        method: options.method,
+        headers: options.headers,
+        body: options.body,
+      }, { signal: options.signal }),
     });
   }
 
@@ -588,54 +456,4 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (url.endsWith("/messages")) headers["anthropic-version"] = ANTHROPIC_API_VERSION;
     return headers;
   }
-}
-
-// ponytail: fallback fetcher when Bun hits a TLS fingerprint block or a runtime
-// error. Uses Node's native fetch (undici TLS) — the upstream gate treats it as
-// a separate rate-limit bucket. Spawned as a child process so the gateway
-// doesn't drag Node-only deps into its main bundle.
-async function tryNodeFallback({ resolve, reject, input, url, headers, transformedBody, bunCode, bunStderr }) {
-  const nodeFallback = process.env.OPENCODE_NODE_FETCHER_PATH?.trim()
-    || path.join(process.cwd(), "_opencode-fetcher.mjs");
-  if (!fs.existsSync(nodeFallback)) {
-    reject(transportError(
-      `opencode Bun fetcher exit=${bunCode} stderr=${String(bunStderr || "").slice(0, 300)}`,
-      "OPENCODE_TRANSPORT_METADATA",
-    ));
-    return;
-  }
-  const cp = await import("node:child_process");
-  const nodeChild = cp.spawn(process.execPath, [nodeFallback], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: process.env,
-    cwd: "/tmp",
-  });
-  const out = [];
-  const err = [];
-  nodeChild.stdout.on("data", (c) => out.push(c));
-  nodeChild.stderr.on("data", (c) => err.push(c));
-  nodeChild.on("error", (error) => reject(transportError("opencode node-fallback spawn failed", "OPENCODE_TRANSPORT_SPAWN", error)));
-  nodeChild.on("close", (code) => {
-    if (code !== 0) {
-      reject(transportError(
-        `opencode node-fallback exit=${code}`,
-        "OPENCODE_TRANSPORT_METADATA",
-        null,
-        Buffer.concat(err).toString("utf8"),
-      ));
-      return;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(Buffer.concat(out).toString("utf8"));
-    } catch (e) {
-      reject(transportError("opencode node-fetcher: bad JSON output", "OPENCODE_TRANSPORT_METADATA", e));
-      return;
-    }
-    resolve({
-      response: new Response(parsed.body, { status: parsed.status, headers: parsed.headers }),
-      url, headers, transformedBody,
-    });
-  });
-  nodeChild.stdin.end(input);
 }
